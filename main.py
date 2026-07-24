@@ -94,5 +94,46 @@ async def coinflip(interaction: discord.Interaction):
     outcome = random.choice(["Heads", "Tails"])
     await interaction.response.send_message(f"🪙 Algorithmic determination result: **{outcome}**")
 
+@bot.tree.command(name="petpet", description="Generates a customized petpet animation overlay for a user asset")
+@app_commands.describe(user="The targeted user to receive the petpet animation asset")
+async def petpet(interaction: discord.Interaction, user: discord.User = None):
+    target_user = user or interaction.user
+    avatar_url = target_user.display_avatar.with_format("png").url
+    petpet_url = f"https://vacefron.nl{avatar_url}"
+    embed = discord.Embed(title=f"Processing affection matrix for {target_user.name}", color=0x00a8fc)
+    embed.set_image(url=petpet_url)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="8ball", description="Queries the algorithmic matrix for a definitive response to a binary query")
+@app_commands.describe(question="The explicit query string directed to the application core")
+async def eightball(interaction: discord.Interaction, question: str):
+    responses = [
+        "It is certain.", "Without a doubt.", "You may rely on it.", 
+        "Reply hazy, try again.", "Ask again later.", "Better not tell you now.", 
+        "Don't count on it.", "My sources say no.", "Outlook not so good."
+    ]
+    outcome = random.choice(responses)
+    await interaction.response.send_message(f"❓ **Query:** {question}\n🔮 **Matrix Response:** {outcome}")
+
+@bot.tree.command(name="userinfo", description="Extracts structured identity profile analytics of a guild member")
+@app_commands.describe(user="The specific member asset to analyze")
+async def userinfo(interaction: discord.Interaction, user: discord.Member = None):
+    target_user = user or interaction.user
+    embed = discord.Embed(title=f"User Analysis: {target_user.name}", color=0x00a8fc)
+    embed.add_field(name="Account Classification", value=f"ID: {target_user.id}", inline=False)
+    embed.add_field(name="Registry Date", value=target_user.created_at.strftime("%Y-%m-%d"), inline=True)
+    embed.add_field(name="Guild Session Initiation", value=target_user.joined_at.strftime("%Y-%m-%d") if target_user.joined_at else "N/A", inline=True)
+    embed.set_thumbnail(url=target_user.display_avatar.url)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="rng", description="Generates a random numerical integer within a specified bound")
+@app_commands.describe(min_val="Minimum bound value", max_val="Maximum bound value")
+async def rng(interaction: discord.Interaction, min_val: int = 1, max_val: int = 100):
+    if min_val >= max_val:
+        await interaction.response.send_message("Execution error: Lower bound must be strictly less than upper bound.", ephemeral=True)
+        return
+    result = random.randint(min_val, max_val)
+    await interaction.response.send_message(f"🔢 Random Integer Generation result [{min_val}-{max_val}]: **{result}**")
+
 keep_alive()
 bot.run(TOKEN)
