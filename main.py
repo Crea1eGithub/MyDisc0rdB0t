@@ -1,4 +1,3 @@
-
 import os
 import random
 import discord
@@ -194,6 +193,34 @@ async def coinflip(interaction: discord.Interaction):
     response = get_string(uid, "coin_result").format(outcome=outcome)
     await interaction.response.send_message(response)
 
+@bot.tree.command(name="petpet", description="Generates a customized petpet animation overlay for a user asset")
+@app_commands.describe(user="The targeted user to receive the petpet animation asset")
+async def petpet(interaction: discord.Interaction, user: discord.User = None):
+    target_user = user or interaction.user
+    avatar_url = target_user.display_avatar.with_format("png").urlpetpet_url = f"vacefron.nl{avatar_url}"
+    title_str = get_string(interaction.user.id, "pet_matrix").format(name=target_user.name)embed = discord.Embed(title=title_str, color=0x00a8fc)
+    embed.set_image(url=petpet_url)
+    await interaction.response.send_message(embed=embed)
+    
+@bot.tree.command(name="rng", description="Generates a random numerical integer within a specified bound")
+@app_commands.describe(min_val="Minimum bound value", max_val="Maximum bound value")
+async def rng(interaction: discord.Interaction, min_val: int = 1, max_val: int = 100):uid = interaction.user.id
+    if min_val >= max_val:
+        await interaction.response.send_message(get_string(uid, "rng_error"), ephemeral=True)return
+        result = random.randint(min_val, max_val)
+        response = get_string(uid, "rng_result").format(min_val=min_val, max_val=max_val, result=result)
+        await interaction.response.send_message(response)
+        @bot.tree.command(name="purge", description="Executes a bulk deletion of a specified quantity of recent messages")
+        @app_commands.describe(limit="The explicit quantity of messages to terminate from the channel history")
+        @app_commands.checks.has_permissions(manage_messages=True)
+        async def purge(interaction: discord.Interaction, limit: int):
+            uid = interaction.user.id
+            if limit < 1 or limit > 100:
+                await interaction.response.send_message(get_string(uid, "purge_limit"), ephemeral=True)
+                return
+                await interaction.response.defer(ephemeral=True)
+                deleted = await interaction.channel.purge(limit=limit)
+                response = get_string(uid, "purge_success").format(count=len(deleted))
+                await interaction.followup.send(response)
 keep_alive()
 bot.run(TOKEN)
-
