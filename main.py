@@ -33,6 +33,9 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 async def on_ready():
     print(f'Logged in successfully as {bot.user.name}')
     try:
+        activity = discord.Activity(type=discord.ActivityType.watching, name="System Performance")
+        await bot.change_presence(status=discord.Status.online, activity=activity)
+        
         synced = await bot.tree.sync()
         print(f"Successfully synchronized {len(synced)} application command(s)")
     except Exception as e:
@@ -65,7 +68,6 @@ async def avatar(interaction: discord.Interaction, user: discord.User = None):
     embed.set_image(url=target_user.display_avatar.url)
     await interaction.response.send_message(embed=embed)
 
-keep_alive()
 @bot.tree.command(name="serverinfo", description="Retrieves comprehensive analytical data regarding the current guild")
 async def serverinfo(interaction: discord.Interaction):
     guild = interaction.guild
@@ -92,5 +94,5 @@ async def coinflip(interaction: discord.Interaction):
     outcome = random.choice(["Heads", "Tails"])
     await interaction.response.send_message(f"🪙 Algorithmic determination result: **{outcome}**")
 
+keep_alive()
 bot.run(TOKEN)
-
