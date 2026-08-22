@@ -1,35 +1,62 @@
 import os
 import random
+from threading import Thread
+
 import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 from flask import Flask
-from threading import Thread
 
-app = Flask('')
+# ============================================================
+# MyDisc0rdB0t - main.py
+# Based on the structure and commands of:
+# https://github.com/Crea1eGithub/MyDisc0rdB0t
+# ============================================================
 
-@app.route('/')
+# ------------------------------------------------------------
+# Optional web server for hosts such as Render/Replit/etc.
+# ------------------------------------------------------------
+app = Flask(__name__)
+
+
+@app.route("/")
 def home():
     return "Status: Operational"
 
+
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host="0.0.0.0", port=port)
+
 
 def keep_alive():
-    t = Thread(target=run_web_server)
-    t.start()
+    thread = Thread(target=run_web_server, daemon=True)
+    thread.start()
 
+
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
 load_dotenv()
-TOKEN = os.getenv('DISCORD_TOKEN')
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+
+if not TOKEN:
+    raise RuntimeError(
+        "DISCORD_TOKEN is not configured. "
+        "Create a .env file with DISCORD_TOKEN=your_bot_token"
+    )
 
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-user_profiles = {}
+# Per-user language preference.
+# False = English, True = Spanish.
+user_profiles: dict[int, bool] = {}
+
 
 LOCALIZATION = {
     False: {
@@ -54,12 +81,12 @@ LOCALIZATION = {
         "user_analysis": "User Analysis: {name}",
         "account_class": "Account Classification",
         "registry_date": "Registry Date",
-        "session_init": "Guild Session Initiation"
+        "session_init": "Guild Session Initiation",
     },
     True: {
         "invalid_die": "Error de ejecución: Un dado válido debe poseer al menos 2 lados.",
         "die_result": "🎲 Lanzaste un dado de **{sides}** lados. Resultado: **{result}**",
-        "pong": "🏓 ¡Pong! Latencia de Red: **{latency}ms**",
+        "pong": "🏓 ¡Pong! Latencia de red: **{latency}ms**",
         "avatar_title": "Avatar de {name}",
         "lang_updated": "Preferencia de idioma cambiada a **Español**.",
         "coin_heads": "Cara",
@@ -68,150 +95,348 @@ LOCALIZATION = {
         "pet_matrix": "Procesando matriz de afecto para {name}",
         "rng_error": "Error de ejecución: El límite inferior debe ser estrictamente menor que el superior.",
         "rng_result": "🔢 Resultado de la generación de entero aleatorio [{min_val}-{max_val}]: **{result}**",
-        "purge_limit": "Límite operacional excedido: El valor debe oscilar estrictamente entre 1 y 100.",
-        "purge_success": "Operación exitosa: Se terminaron {count} entradas de mensajes.",
-        "guild_spec": "Especificaciones del Servidor: {name}",
-        "guild_id": "Clave de Identificación",
-        "guild_owner": "Propietario Administrativo",
-        "guild_members": "Membresía Total",
-        "ball_title": "🔮 Respuesta de la Matriz:",
-        "user_analysis": "Análisis de Usuario: {name}",
-        "account_class": "Clasificación de la Cuenta",
-        "registry_date": "Fecha de Registro",
-        "session_init": "Inicio de Sesión en el Servidor"
-    }
+        "purge_limit": "Límite operacional excedido: el valor debe estar entre 1 y 100.",
+        "purge_success": "Operación exitosa: se eliminaron {count} mensajes.",
+        "guild_spec": "Especificaciones del servidor: {name}",
+        "guild_id": "Clave de identificación",
+        "guild_owner": "Propietario administrativo",
+        "guild_members": "Miembros totales",
+        "ball_title": "🔮 Respuesta de la matriz:",
+        "user_analysis": "Análisis de usuario: {name}",
+        "account_class": "Clasificación de la cuenta",
+        "registry_date": "Fecha de registro",
+        "session_init": "Inicio de sesión en el servidor",
+    },
 }
+
 
 def get_string(user_id: int, key: str) -> str:
     is_spanish = user_profiles.get(user_id, False)
     return LOCALIZATION[is_spanish][key]
 
+
+# ------------------------------------------------------------
+# Events
+# ------------------------------------------------------------
 @bot.event
 async def on_ready():
-    print(f'Logged in successfully as {bot.user.name}')
-    try:
-        activity = discord.Activity(type=discord.ActivityType.watching, name="System Performance")
-        await bot.change_presence(status=discord.Status.online, activity=activity)
-        synced = await bot.tree.sync()
-        print(f"Successfully synchronized {len(synced)} application command(s)")
-    except Exception as e:
-        print(f"Synchronization failure: {e}")
-@bot.tree.command(name="switchengesp", description="Toggles your account interaction profile language between English and Español")
-async def switchengesp(interaction: discord.Interaction):
-    uid = interaction.user.id
-    user_profiles[uid] = not user_profiles.get(uid, False)
-    response = get_string(uid, "lang_updated")
-    await interaction.response.send_message(response, ephemeral=True)
+    print(f"Logged in successfully as {bot.user} (ID: {bot.user.id})")
 
-@bot.tree.command(name="say", description="Echoes back the specified message text")
-@app_commands.describe(message="The message string to be replicated by the bot")
+    try:
+        activity = discord.Activity(
+            type=discord.ActivityType.watching,
+            name="System Performance",
+        )
+        await bot.change_presence(
+            status=discord.Status.online,
+            activity=activity,
+        )
+
+        synced = await bot.tree.sync()
+        print(f"Successfully synchronized {len(synced)} application command(s).")
+
+    except Exception as error:
+        print(f"Synchronization failure: {error}")
+
+
+# ------------------------------------------------------------
+# Commands
+# ------------------------------------------------------------
+@bot.tree.command(
+    name="switchengesp",
+    description="Toggle your interaction language between English and Español.",
+)
+async def switchengesp(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    user_profiles[user_id] = not user_profiles.get(user_id, False)
+
+    await interaction.response.send_message(
+        get_string(user_id, "lang_updated"),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="say", description="Echo the specified message.")
+@app_commands.describe(message="The message to repeat.")
 async def say(interaction: discord.Interaction, message: str):
     await interaction.response.send_message(message)
 
-@bot.tree.command(name="ping", description="Retrieves the current network latency of the application")
+
+@bot.tree.command(name="ping", description="Show the bot's current latency.")
 async def ping(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
     response = get_string(interaction.user.id, "pong").format(latency=latency)
     await interaction.response.send_message(response)
 
-@bot.tree.command(name="roll", description="Simulates rolling a standard or custom multi-sided die")
-@app_commands.describe(sides="The total number of sides for the die execution")
+
+@bot.tree.command(name="roll", description="Roll a die with a custom number of sides.")
+@app_commands.describe(sides="Number of sides. Minimum: 2.")
 async def roll(interaction: discord.Interaction, sides: int = 6):
-    uid = interaction.user.id
+    user_id = interaction.user.id
+
     if sides < 2:
-        await interaction.response.send_message(get_string(uid, "invalid_die"), ephemeral=True)
+        await interaction.response.send_message(
+            get_string(user_id, "invalid_die"),
+            ephemeral=True,
+        )
         return
+
     result = random.randint(1, sides)
-    response = get_string(uid, "die_result").format(sides=sides, result=result)
+    response = get_string(user_id, "die_result").format(
+        sides=sides,
+        result=result,
+    )
     await interaction.response.send_message(response)
 
-@bot.tree.command(name="avatar", description="Fetches and displays the profile asset of a designated user")
-@app_commands.describe(user="The target user whose profile asset is to be retrieved")
-async def avatar(interaction: discord.Interaction, user: discord.User = None):
+
+@bot.tree.command(name="avatar", description="Display a user's avatar.")
+@app_commands.describe(user="The user whose avatar you want to display.")
+async def avatar(
+    interaction: discord.Interaction,
+    user: discord.User | None = None,
+):
     target_user = user or interaction.user
-    title_str = get_string(interaction.user.id, "avatar_title").format(name=target_user.name)
-    embed = discord.Embed(title=title_str, color=0x00a8fc)
+
+    embed = discord.Embed(
+        title=get_string(interaction.user.id, "avatar_title").format(
+            name=target_user.name
+        ),
+        color=0x00A8FC,
+    )
     embed.set_image(url=target_user.display_avatar.url)
+
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="coinflip", description="Executes a binary randomized determination algorithm")
+
+@bot.tree.command(name="coinflip", description="Flip a virtual coin.")
 async def coinflip(interaction: discord.Interaction):
-    uid = interaction.user.id
-    sides_list = [get_string(uid, "coin_heads"), get_string(uid, "coin_tails")]
-    outcome = random.choice(sides_list)
-    response = get_string(uid, "coin_result").format(outcome=outcome)
+    user_id = interaction.user.id
+
+    outcome = random.choice(
+        [
+            get_string(user_id, "coin_heads"),
+            get_string(user_id, "coin_tails"),
+        ]
+    )
+
+    response = get_string(user_id, "coin_result").format(outcome=outcome)
     await interaction.response.send_message(response)
 
-@bot.tree.command(name="petpet", description="Generates a customized petpet animation overlay for a user asset")
-@app_commands.describe(user="The targeted user to receive the petpet animation asset")
-async def petpet(interaction: discord.Interaction, user: discord.User = None):
+
+@bot.tree.command(name="petpet", description="Generate a petpet image from a user's avatar.")
+@app_commands.describe(user="The user whose avatar will be used.")
+async def petpet(
+    interaction: discord.Interaction,
+    user: discord.User | None = None,
+):
     target_user = user or interaction.user
     avatar_url = target_user.display_avatar.with_format("png").url
-    petpet_url = f"https://vacefron.nl{avatar_url}"
-    title_str = get_string(interaction.user.id, "pet_matrix").format(name=target_user.name)
-    embed = discord.Embed(title=title_str, color=0x00a8fc)
+
+    # Kept compatible with the original repository's idea.
+    petpet_url = f"https://vacefron.nl/api/petpet?image={avatar_url}"
+
+    embed = discord.Embed(
+        title=get_string(interaction.user.id, "pet_matrix").format(
+            name=target_user.name
+        ),
+        color=0x00A8FC,
+    )
     embed.set_image(url=petpet_url)
+
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="rng", description="Generates a random numerical integer within a specified bound")
-@app_commands.describe(min_val="Minimum bound value", max_val="Maximum bound value")
-async def rng(interaction: discord.Interaction, min_val: int = 1, max_val: int = 100):
-    uid = interaction.user.id
+
+@bot.tree.command(name="rng", description="Generate a random integer in a range.")
+@app_commands.describe(
+    min_val="Minimum value.",
+    max_val="Maximum value.",
+)
+async def rng(
+    interaction: discord.Interaction,
+    min_val: int = 1,
+    max_val: int = 100,
+):
+    user_id = interaction.user.id
+
     if min_val >= max_val:
-        await interaction.response.send_message(get_string(uid, "rng_error"), ephemeral=True)
+        await interaction.response.send_message(
+            get_string(user_id, "rng_error"),
+            ephemeral=True,
+        )
         return
+
     result = random.randint(min_val, max_val)
-    response = get_string(uid, "rng_result").format(min_val=min_val, max_val=max_val, result=result)
+    response = get_string(user_id, "rng_result").format(
+        min_val=min_val,
+        max_val=max_val,
+        result=result,
+    )
     await interaction.response.send_message(response)
 
-@bot.tree.command(name="purge", description="Executes a bulk deletion of a specified quantity of recent messages")
-@app_commands.describe(limit="The explicit quantity of messages to terminate from the channel history")
+
+@bot.tree.command(
+    name="purge",
+    description="Delete up to 100 recent messages.",
+)
+@app_commands.describe(limit="Number of messages to delete (1-100).")
 @app_commands.checks.has_permissions(manage_messages=True)
 async def purge(interaction: discord.Interaction, limit: int):
-    uid = interaction.user.id
-    if limit < 1 or limit > 100:
-        await interaction.response.send_message(get_string(uid, "purge_limit"), ephemeral=True)
+    user_id = interaction.user.id
+
+    if not 1 <= limit <= 100:
+        await interaction.response.send_message(
+            get_string(user_id, "purge_limit"),
+            ephemeral=True,
+        )
         return
+
     await interaction.response.defer(ephemeral=True)
-    deleted = await interaction.channel.purge(limit=limit)
-    response = get_string(uid, "purge_success").format(count=len(deleted))
-    await interaction.followup.send(response)
 
-@bot.tree.command(name="serverinfo", description="Retrieves comprehensive analytical data regarding the current guild")
+    try:
+        deleted = await interaction.channel.purge(limit=limit)
+        response = get_string(user_id, "purge_success").format(
+            count=len(deleted)
+        )
+        await interaction.followup.send(response)
+    except (discord.Forbidden, discord.HTTPException) as error:
+        await interaction.followup.send(
+            f"Could not delete messages: {error}"
+        )
+
+
+@purge.error
+async def purge_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+):
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "You need the **Manage Messages** permission to use this command."
+    else:
+        message = "An error occurred while executing `/purge`."
+
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
+@bot.tree.command(
+    name="serverinfo",
+    description="Display information about the current server.",
+)
 async def serverinfo(interaction: discord.Interaction):
-    uid = interaction.user.id
+    user_id = interaction.user.id
     guild = interaction.guild
-    embed = discord.Embed(title=get_string(uid, "guild_spec").format(name=guild.name), color=0x00a8fc)
-    embed.add_field(name=get_string(uid, "guild_id"), value=guild.id, inline=True)
-    embed.add_field(name=get_string(uid, "guild_owner"), value=guild.owner, inline=True)
-    embed.add_field(name=get_string(uid, "guild_members"), value=guild.member_count, inline=True)
-    embed.set_thumbnail(url=guild.icon.url if guild.icon else None)
+
+    if guild is None:
+        await interaction.response.send_message(
+            "This command can only be used inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title=get_string(user_id, "guild_spec").format(name=guild.name),
+        color=0x00A8FC,
+    )
+
+    embed.add_field(
+        name=get_string(user_id, "guild_id"),
+        value=str(guild.id),
+        inline=True,
+    )
+    embed.add_field(
+        name=get_string(user_id, "guild_owner"),
+        value=str(guild.owner) if guild.owner else "Unknown",
+        inline=True,
+    )
+    embed.add_field(
+        name=get_string(user_id, "guild_members"),
+        value=str(guild.member_count),
+        inline=True,
+    )
+
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="8ball", description="Queries the algorithmic matrix for a definitive response to a binary query")
-@app_commands.describe(question="The explicit query string directed to the application core")
+
+@bot.tree.command(
+    name="8ball",
+    description="Ask the virtual 8-ball a question.",
+)
+@app_commands.describe(question="Your question.")
 async def eightball(interaction: discord.Interaction, question: str):
-    uid = interaction.user.id
     responses = [
-        "It is certain.", "Without a doubt.", "You may rely on it.", 
-        "Reply hazy, try again.", "Ask again later.", "Better not tell you now.", 
-        "Don't count on it.", "My sources say no.", "Outlook not so good."
+        "It is certain.",
+        "Without a doubt.",
+        "You may rely on it.",
+        "Reply hazy, try again.",
+        "Ask again later.",
+        "Better not tell you now.",
+        "Don't count on it.",
+        "My sources say no.",
+        "Outlook not so good.",
     ]
-    outcome = random.choice(responses)
-    await interaction.response.send_message(f"❓ **Query:** {question}\n{get_string(uid, 'ball_title')} {outcome}")
 
-@bot.tree.command(name="userinfo", description="Extracts structured identity profile analytics of a guild member")
-@app_commands.describe(user="The specific member asset to analyze")
-async def userinfo(interaction: discord.Interaction, user: discord.Member = None):
-    uid = interaction.user.id
+    outcome = random.choice(responses)
+
+    await interaction.response.send_message(
+        f"❓ **Query:** {question}\n"
+        f"{get_string(interaction.user.id, 'ball_title')} {outcome}"
+    )
+
+
+@bot.tree.command(
+    name="userinfo",
+    description="Display information about a server member.",
+)
+@app_commands.describe(user="The member to inspect.")
+async def userinfo(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+):
+    user_id = interaction.user.id
     target_user = user or interaction.user
-    embed = discord.Embed(title=get_string(uid, "user_analysis").format(name=target_user.name), color=0x00a8fc)
-    embed.add_field(name=get_string(uid, "account_class"), value=f"ID: {target_user.id}", inline=False)
-    embed.add_field(name=get_string(uid, "registry_date"), value=target_user.created_at.strftime("%Y-%m-%d"), inline=True)
-    embed.add_field(name=get_string(uid, "session_init"), value=target_user.joined_at.strftime("%Y-%m-%d") if target_user.joined_at else "N/A", inline=True)
+
+    embed = discord.Embed(
+        title=get_string(user_id, "user_analysis").format(
+            name=target_user.name
+        ),
+        color=0x00A8FC,
+    )
+
+    embed.add_field(
+        name=get_string(user_id, "account_class"),
+        value=f"ID: {target_user.id}",
+        inline=False,
+    )
+    embed.add_field(
+        name=get_string(user_id, "registry_date"),
+        value=target_user.created_at.strftime("%Y-%m-%d"),
+        inline=True,
+    )
+    embed.add_field(
+        name=get_string(user_id, "session_init"),
+        value=(
+            target_user.joined_at.strftime("%Y-%m-%d")
+            if target_user.joined_at
+            else "N/A"
+        ),
+        inline=True,
+    )
     embed.set_thumbnail(url=target_user.display_avatar.url)
+
     await interaction.response.send_message(embed=embed)
 
-keep_alive()
-bot.run(TOKEN)
 
+# ------------------------------------------------------------
+# Start
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    # Remove this line if your hosting provider does not need
+    # the auxiliary HTTP server.
+    keep_alive()
+
+    bot.run(TOKEN)
