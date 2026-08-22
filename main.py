@@ -8,15 +8,6 @@ from discord.ext import commands
 from dotenv import load_dotenv
 from flask import Flask
 
-# ============================================================
-# MyDisc0rdB0t - main.py
-# Based on the structure and commands of:
-# https://github.com/Crea1eGithub/MyDisc0rdB0t
-# ============================================================
-
-# ------------------------------------------------------------
-# Optional web server for hosts such as Render/Replit/etc.
-# ------------------------------------------------------------
 app = Flask(__name__)
 
 
