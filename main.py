@@ -3,6 +3,7 @@ import random
 import asyncio
 from datetime import datetime, timezone, timedelta
 from threading import Thread
+from collections import defaultdict, deque
 
 from openai import OpenAI
 from io import BytesIO
@@ -16,15 +17,6 @@ from discord.ext import commands
 from dotenv import load_dotenv
 from flask import Flask
 
-# ============================================================
-# MyDisc0rdB0t - main.py
-# Based on the structure and commands of:
-# https://github.com/Crea1eGithub/MyDisc0rdB0t
-# ============================================================
-
-# ------------------------------------------------------------
-# Optional web server for hosts such as Render/Replit/etc.
-# ------------------------------------------------------------
 app = Flask(__name__)
 
 
@@ -43,9 +35,6 @@ def keep_alive():
     thread.start()
 
 
-# ------------------------------------------------------------
-# Configuration
-# ------------------------------------------------------------
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -63,7 +52,6 @@ if not AI_KEY:
         "Create a .env file with AI-KEY=your_groq_api_key"
     )
 
-# Groq provides an OpenAI-compatible API.
 ai_client = OpenAI(
     api_key=AI_KEY,
     base_url="https://api.groq.com/openai/v1",
@@ -84,10 +72,10 @@ bot = commands.Bot(
     ),
 )
 
-# Per-user language preference.
-# False = English, True = Spanish.
 user_profiles: dict[int, bool] = {}
 
+# Historial de los últimos 15 /ai por canal
+ai_history: dict[int, deque] = defaultdict(lambda: deque(maxlen=15))
 
 LOCALIZATION = {
     False: {
@@ -109,6 +97,7 @@ LOCALIZATION = {
         "guild_owner": "Administrative Owner",
         "guild_members": "Total Membership",
         "ball_title": "🔮 Matrix Response:",
+        "query_label": "Query",
         "user_analysis": "User Analysis: {name}",
         "account_class": "Account Classification",
         "registry_date": "Registry Date",
@@ -133,11 +122,45 @@ LOCALIZATION = {
         "guild_owner": "Propietario administrativo",
         "guild_members": "Miembros totales",
         "ball_title": "🔮 Respuesta de la matriz:",
+        "query_label": "Pregunta",
         "user_analysis": "Análisis de usuario: {name}",
         "account_class": "Clasificación de la cuenta",
         "registry_date": "Fecha de registro",
         "session_init": "Inicio de sesión en el servidor",
     },
+}
+
+BALL_RESPONSES = {
+    False: [
+        "It is certain.",
+        "Without a doubt.",
+        "You may rely on it.",
+        "Reply hazy, try again.",
+        "Ask again later.",
+        "Better not tell you now.",
+        "Don't count on it.",
+        "My sources say no.",
+        "Outlook not so good.",
+        "Yes.",
+        "No.",
+        "Most likely.",
+        "Very doubtful.",
+    ],
+    True: [
+        "Es cierto.",
+        "Sin ninguna duda.",
+        "Puedes confiar en ello.",
+        "Respuesta confusa, intenta de nuevo.",
+        "Pregunta más tarde.",
+        "Mejor no te lo digo ahora.",
+        "No cuentes con ello.",
+        "Mis fuentes dicen que no.",
+        "Las perspectivas no son buenas.",
+        "Sí.",
+        "No.",
+        "Muy probable.",
+        "Muy dudoso.",
+    ],
 }
 
 
@@ -146,9 +169,6 @@ def get_string(user_id: int, key: str) -> str:
     return LOCALIZATION[is_spanish][key]
 
 
-# ------------------------------------------------------------
-# Events
-# ------------------------------------------------------------
 @bot.event
 async def on_ready():
     print(f"Logged in successfully as {bot.user} (ID: {bot.user.id})")
@@ -170,19 +190,14 @@ async def on_ready():
         print(f"Synchronization failure: {error}")
 
 
-# ------------------------------------------------------------
-# Commands
-# ------------------------------------------------------------
 @bot.tree.command(
     name="ai",
     description="Ask the AI between 06:00 and 21:00.",
 )
 @app_commands.describe(prompt="What you want to ask the AI.")
 async def ai(interaction: discord.Interaction, prompt: str):
-    # Colombia time (UTC-5), independent of the server's timezone.
     colombia_time = datetime.now(timezone(timedelta(hours=-5)))
 
-    # Available from 06:00 inclusive until 21:00 exclusive.
     if not 6 <= colombia_time.hour < 21:
         await interaction.response.send_message(
             "🤖 AI is currently offline. Available hours: **06:00–21:00**.",
@@ -197,21 +212,37 @@ async def ai(interaction: discord.Interaction, prompt: str):
         )
         return
 
-    # Defer while waiting for Groq.
     await interaction.response.defer()
+
+    channel_id = interaction.channel.id if interaction.channel else 0
+    username = interaction.user.display_name
+
+    # Historial de los últimos 15 /ai de este canal
+    history_lines = []
+    for entry in ai_history[channel_id]:
+        history_lines.append(f"- {entry['user']}: {entry['prompt']}")
+    history_text = "\n".join(history_lines) if history_lines else "No previous /ai messages in this channel."
+
+    system_prompt = f"""You are a Discord bot AI assistant.
+Your source code is publicly available at: https://github.com/Crea1eGithub/MyDisc0rdB0t
+
+The user who just ran the /ai command is: {username}
+
+Recent /ai history in this chat (last 15 prompts):
+{history_text}
+
+Answer clearly and helpfully. You can be casual and match the user's tone when appropriate.
+Keep responses reasonably concise unless more detail is requested.
+"""
+
+    start_time = asyncio.get_event_loop().time()
 
     try:
         completion = await asyncio.to_thread(
             ai_client.chat.completions.create,
             model=AI_MODEL,
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are the AI assistant inside a Discord bot. "
-                        "Answer clearly, helpfully, and reasonably concisely."
-                    ),
-                },
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
             max_tokens=1200,
@@ -219,15 +250,29 @@ async def ai(interaction: discord.Interaction, prompt: str):
 
         answer = completion.choices[0].message.content or "No response generated."
 
-        # Artificial thinking delay: longer answers take longer.
-        # Minimum 1s, ~15ms per character, maximum 20s.
-        delay = min(20.0, max(1.0, len(answer) * 0.015))
-        await asyncio.sleep(delay)
+        elapsed = asyncio.get_event_loop().time() - start_time
+        thinking_seconds = max(1, round(elapsed))
 
-        # Discord has a 2000-character message limit.
-        if len(answer) <= 2000:
-            await interaction.followup.send(answer)
+        # Guardar en el historial del canal
+        ai_history[channel_id].append({
+            "user": username,
+            "prompt": prompt[:300],
+        })
+
+        # Formato exacto solicitado
+        response_text = (
+            f"-# {prompt}\n"
+            f"\"Ö\" ahh bot thought for {thinking_seconds} seconds\n"
+            f"{answer}"
+        )
+
+        if len(response_text) <= 2000:
+            await interaction.followup.send(response_text)
         else:
+            await interaction.followup.send(
+                f"-# {prompt}\n"
+                f"\"Ö\" ahh bot thought for {thinking_seconds} seconds"
+            )
             for start in range(0, len(answer), 1900):
                 await interaction.followup.send(answer[start:start + 1900])
 
@@ -340,7 +385,6 @@ async def petpet(
     resolution: int = 128,
     no_server_pfp: bool = False,
 ):
-    """Generate a PetPet GIF using Vencord's 10-frame animation geometry."""
     supplied = sum(source is not None for source in (image, url, user))
 
     if supplied > 1:
@@ -357,7 +401,6 @@ async def petpet(
         )
         return
 
-    # Vencord rounds delay to the nearest 10ms.
     delay = round(delay / 10) * 10
     resolution = max(32, min(resolution, 512))
 
@@ -367,9 +410,6 @@ async def petpet(
     await interaction.response.defer()
 
     try:
-        # ----------------------------------------------------
-        # Resolve source image
-        # ----------------------------------------------------
         if image is not None:
             if not image.content_type or not image.content_type.startswith("image/"):
                 raise ValueError("The attachment must be an image.")
@@ -390,7 +430,6 @@ async def petpet(
             target = user or interaction.user
             avatar_url = target.display_avatar.with_format("png").url
 
-            # In a server, Vencord can use the server-specific avatar.
             if interaction.guild is not None and not no_server_pfp:
                 member = interaction.guild.get_member(target.id)
                 if member is not None:
@@ -405,9 +444,6 @@ async def petpet(
 
         avatar = Image.open(BytesIO(image_bytes)).convert("RGBA")
 
-        # ----------------------------------------------------
-        # Download Vencord's 10 PetPet hand frames
-        # ----------------------------------------------------
         frame_urls = [
             f"https://raw.githubusercontent.com/VenPlugs/petpet/main/frames/pet{i}.gif"
             for i in range(10)
@@ -428,7 +464,6 @@ async def petpet(
         pet_frames = []
         for data in frame_bytes:
             frame_image = Image.open(BytesIO(data))
-            # The repository supplies one GIF per animation frame.
             frame_image.seek(0)
             pet_frames.append(
                 frame_image.convert("RGBA").resize(
@@ -437,9 +472,6 @@ async def petpet(
                 )
             )
 
-        # ----------------------------------------------------
-        # Render frames using Vencord's geometry
-        # ----------------------------------------------------
         output_frames = []
 
         for i, hand_frame in enumerate(pet_frames):
@@ -475,9 +507,6 @@ async def petpet(
 
             output_frames.append(canvas)
 
-        # ----------------------------------------------------
-        # Encode GIF
-        # ----------------------------------------------------
         gif_buffer = BytesIO()
         output_frames[0].save(
             gif_buffer,
@@ -632,23 +661,17 @@ async def serverinfo(interaction: discord.Interaction):
 )
 @app_commands.describe(question="Your question.")
 async def eightball(interaction: discord.Interaction, question: str):
-    responses = [
-        "It is certain.",
-        "Without a doubt.",
-        "You may rely on it.",
-        "Reply hazy, try again.",
-        "Ask again later.",
-        "Better not tell you now.",
-        "Don't count on it.",
-        "My sources say no.",
-        "Outlook not so good.",
-    ]
-
+    user_id = interaction.user.id
+    is_spanish = user_profiles.get(user_id, False)
+    responses = BALL_RESPONSES[is_spanish]
     outcome = random.choice(responses)
 
+    query_label = get_string(user_id, "query_label")
+    ball_title = get_string(user_id, "ball_title")
+
     await interaction.response.send_message(
-        f"❓ **Query:** {question}\n"
-        f"{get_string(interaction.user.id, 'ball_title')} {outcome}"
+        f"❓ **{query_label}:** {question}\n"
+        f"{ball_title} {outcome}"
     )
 
 
@@ -695,12 +718,6 @@ async def userinfo(
     await interaction.response.send_message(embed=embed)
 
 
-# ------------------------------------------------------------
-# Start
-# ------------------------------------------------------------
 if __name__ == "__main__":
-    # Remove this line if your hosting provider does not need
-    # the auxiliary HTTP server.
     keep_alive()
-
     bot.run(TOKEN)
