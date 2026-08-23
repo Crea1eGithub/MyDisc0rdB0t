@@ -5,6 +5,10 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 
 from openai import OpenAI
+from io import BytesIO
+
+import aiohttp
+from PIL import Image
 
 import discord
 from discord import app_commands
@@ -70,7 +74,15 @@ AI_MODEL = "openai/gpt-oss-20b"
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    allowed_contexts=app_commands.AppCommandContext(
+        guild=True,
+        dm_channel=True,
+        private_channel=True,
+    ),
+)
 
 # Per-user language preference.
 # False = English, True = Spanish.
@@ -307,27 +319,188 @@ async def coinflip(interaction: discord.Interaction):
     await interaction.response.send_message(response)
 
 
-@bot.tree.command(name="petpet", description="Generate a petpet image from a user's avatar.")
-@app_commands.describe(user="The user whose avatar will be used.")
+@bot.tree.command(
+    name="petpet",
+    description="Create a Vencord-style PetPet GIF.",
+)
+@app_commands.describe(
+    image="Image attachment to use.",
+    url="Direct URL to an image.",
+    user="User whose avatar to use.",
+    delay="Delay between frames in ms. Minimum 20.",
+    resolution="GIF resolution. Default: 128.",
+    no_server_pfp="Use the normal avatar instead of the server avatar.",
+)
 async def petpet(
     interaction: discord.Interaction,
+    image: discord.Attachment | None = None,
+    url: str | None = None,
     user: discord.User | None = None,
+    delay: int = 20,
+    resolution: int = 128,
+    no_server_pfp: bool = False,
 ):
-    target_user = user or interaction.user
-    avatar_url = target_user.display_avatar.with_format("png").url
+    """Generate a PetPet GIF using Vencord's 10-frame animation geometry."""
+    supplied = sum(source is not None for source in (image, url, user))
 
-    # Kept compatible with the original repository's idea.
-    petpet_url = f"https://vacefron.nl/api/petpet?image={avatar_url}"
+    if supplied > 1:
+        await interaction.response.send_message(
+            "Use only one image source: `image`, `url`, or `user`.",
+            ephemeral=True,
+        )
+        return
 
-    embed = discord.Embed(
-        title=get_string(interaction.user.id, "pet_matrix").format(
-            name=target_user.name
-        ),
-        color=0x00A8FC,
-    )
-    embed.set_image(url=petpet_url)
+    if delay < 20:
+        await interaction.response.send_message(
+            "Delay must be at least **20 ms**.",
+            ephemeral=True,
+        )
+        return
 
-    await interaction.response.send_message(embed=embed)
+    # Vencord rounds delay to the nearest 10ms.
+    delay = round(delay / 10) * 10
+    resolution = max(32, min(resolution, 512))
+
+    if supplied == 0:
+        user = interaction.user
+
+    await interaction.response.defer()
+
+    try:
+        # ----------------------------------------------------
+        # Resolve source image
+        # ----------------------------------------------------
+        if image is not None:
+            if not image.content_type or not image.content_type.startswith("image/"):
+                raise ValueError("The attachment must be an image.")
+            image_bytes = await image.read()
+
+        elif url is not None:
+            if not url.lower().startswith(("http://", "https://")):
+                raise ValueError("The image URL must start with http:// or https://.")
+
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        raise ValueError(f"Could not download the image (HTTP {response.status}).")
+                    image_bytes = await response.read()
+
+        else:
+            target = user or interaction.user
+            avatar_url = target.display_avatar.with_format("png").url
+
+            # In a server, Vencord can use the server-specific avatar.
+            if interaction.guild is not None and not no_server_pfp:
+                member = interaction.guild.get_member(target.id)
+                if member is not None:
+                    avatar_url = member.display_avatar.with_format("png").url
+
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(avatar_url) as response:
+                    if response.status != 200:
+                        raise ValueError(f"Could not download the avatar (HTTP {response.status}).")
+                    image_bytes = await response.read()
+
+        avatar = Image.open(BytesIO(image_bytes)).convert("RGBA")
+
+        # ----------------------------------------------------
+        # Download Vencord's 10 PetPet hand frames
+        # ----------------------------------------------------
+        frame_urls = [
+            f"https://raw.githubusercontent.com/VenPlugs/petpet/main/frames/pet{i}.gif"
+            for i in range(10)
+        ]
+
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async def fetch_frame(frame_url: str) -> bytes:
+                async with session.get(frame_url) as response:
+                    if response.status != 200:
+                        raise ValueError(f"Could not download PetPet frame (HTTP {response.status}).")
+                    return await response.read()
+
+            frame_bytes = await asyncio.gather(
+                *(fetch_frame(frame_url) for frame_url in frame_urls)
+            )
+
+        pet_frames = []
+        for data in frame_bytes:
+            frame_image = Image.open(BytesIO(data))
+            # The repository supplies one GIF per animation frame.
+            frame_image.seek(0)
+            pet_frames.append(
+                frame_image.convert("RGBA").resize(
+                    (resolution, resolution),
+                    Image.Resampling.LANCZOS,
+                )
+            )
+
+        # ----------------------------------------------------
+        # Render frames using Vencord's geometry
+        # ----------------------------------------------------
+        output_frames = []
+
+        for i, hand_frame in enumerate(pet_frames):
+            j = i if i < 5 else 10 - i
+
+            width = 0.8 + j * 0.02
+            height = 0.8 - j * 0.05
+            offset_x = (1 - width) * 0.5 + 0.1
+            offset_y = 1 - height - 0.08
+
+            canvas = Image.new(
+                "RGBA",
+                (resolution, resolution),
+                (0, 0, 0, 0),
+            )
+
+            resized_avatar = avatar.resize(
+                (
+                    max(1, round(width * resolution)),
+                    max(1, round(height * resolution)),
+                ),
+                Image.Resampling.LANCZOS,
+            )
+
+            canvas.alpha_composite(
+                resized_avatar,
+                (
+                    round(offset_x * resolution),
+                    round(offset_y * resolution),
+                ),
+            )
+            canvas.alpha_composite(hand_frame)
+
+            output_frames.append(canvas)
+
+        # ----------------------------------------------------
+        # Encode GIF
+        # ----------------------------------------------------
+        gif_buffer = BytesIO()
+        output_frames[0].save(
+            gif_buffer,
+            format="GIF",
+            save_all=True,
+            append_images=output_frames[1:],
+            duration=delay,
+            loop=0,
+            disposal=2,
+            optimize=False,
+        )
+        gif_buffer.seek(0)
+
+        await interaction.followup.send(
+            file=discord.File(gif_buffer, filename="petpet.gif")
+        )
+
+    except Exception as error:
+        print(f"PetPet failure: {error}")
+        await interaction.followup.send(
+            "⚠️ PetPet could not generate the GIF. "
+            f"Reason: `{error}`"
+        )
 
 
 @bot.tree.command(name="rng", description="Generate a random integer in a range.")
@@ -366,6 +539,13 @@ async def rng(
 @app_commands.checks.has_permissions(manage_messages=True)
 async def purge(interaction: discord.Interaction, limit: int):
     user_id = interaction.user.id
+
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used inside a server.",
+            ephemeral=True,
+        )
+        return
 
     if not 1 <= limit <= 100:
         await interaction.response.send_message(
@@ -479,7 +659,7 @@ async def eightball(interaction: discord.Interaction, question: str):
 @app_commands.describe(user="The member to inspect.")
 async def userinfo(
     interaction: discord.Interaction,
-    user: discord.Member | None = None,
+    user: discord.User | None = None,
 ):
     user_id = interaction.user.id
     target_user = user or interaction.user
@@ -505,7 +685,7 @@ async def userinfo(
         name=get_string(user_id, "session_init"),
         value=(
             target_user.joined_at.strftime("%Y-%m-%d")
-            if target_user.joined_at
+            if isinstance(target_user, discord.Member) and target_user.joined_at
             else "N/A"
         ),
         inline=True,
