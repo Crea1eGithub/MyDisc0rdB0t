@@ -39,6 +39,7 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 AI_KEY = os.getenv("AI-KEY")
+NIGHT_OWL_KEY = os.getenv("NIGHT-OWL")
 
 if not TOKEN:
     raise RuntimeError(
@@ -52,12 +53,14 @@ if not AI_KEY:
         "Create a .env file with AI-KEY=your_groq_api_key"
     )
 
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+AI_MODEL = "openai/gpt-oss-20b"
+NIGHT_OWL_PREFIX = "[night-owl=on]"
+
 ai_client = OpenAI(
     api_key=AI_KEY,
-    base_url="https://api.groq.com/openai/v1",
+    base_url=GROQ_BASE_URL,
 )
-
-AI_MODEL = "openai/gpt-oss-20b"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -169,6 +172,24 @@ def get_string(user_id: int, key: str) -> str:
     return LOCALIZATION[is_spanish][key]
 
 
+def parse_night_owl_prompt(raw_prompt: str) -> tuple[bool, str]:
+    stripped = raw_prompt.lstrip()
+    prefix = NIGHT_OWL_PREFIX
+    if stripped.lower().startswith(prefix.lower()):
+        cleaned = stripped[len(prefix):].lstrip()
+        return True, cleaned
+    return False, raw_prompt.strip()
+
+
+def is_ai_online() -> bool:
+    colombia_time = datetime.now(timezone(timedelta(hours=-5)))
+    return 6 <= colombia_time.hour < 21
+
+
+def make_ai_client(api_key: str) -> OpenAI:
+    return OpenAI(api_key=api_key, base_url=GROQ_BASE_URL)
+
+
 @bot.event
 async def on_ready():
     print(f"Logged in successfully as {bot.user} (ID: {bot.user.id})")
@@ -192,32 +213,45 @@ async def on_ready():
 
 @bot.tree.command(
     name="ai",
-    description="Ask the AI between 06:00 and 21:00.",
+    description="Ask the AI between 06:00 and 21:00 (Colombia). Use [night-owl=on] at night.",
 )
 @app_commands.describe(prompt="What you want to ask the AI.")
 async def ai(interaction: discord.Interaction, prompt: str):
-    colombia_time = datetime.now(timezone(timedelta(hours=-5)))
+    night_owl, clean_prompt = parse_night_owl_prompt(prompt)
+    online = is_ai_online()
 
-    if not 6 <= colombia_time.hour < 21:
+    if not online and not night_owl:
         await interaction.response.send_message(
-            "🤖 AI is currently offline. Available hours: **06:00–21:00**.",
+            "🤖 AI is currently offline. Available hours: **06:00–21:00**.\n"
+            "To ask at night, start your prompt with `[night-owl=on]`.",
             ephemeral=True,
         )
         return
 
-    if not prompt.strip():
+    if not clean_prompt:
         await interaction.response.send_message(
             "Please provide a prompt.",
             ephemeral=True,
         )
         return
 
+    use_night_owl = night_owl and not online
+    if use_night_owl:
+        if not NIGHT_OWL_KEY:
+            await interaction.response.send_message(
+                "Night Owl is not configured. Set the `NIGHT-OWL` key in the environment.",
+                ephemeral=True,
+            )
+            return
+        client = make_ai_client(NIGHT_OWL_KEY)
+    else:
+        client = ai_client
+
     await interaction.response.defer()
 
     channel_id = interaction.channel.id if interaction.channel else 0
     username = interaction.user.display_name
 
-    # Historial de los últimos 15 /ai de este canal
     history_lines = []
     for entry in ai_history[channel_id]:
         history_lines.append(f"- {entry['user']}: {entry['prompt']}")
@@ -239,11 +273,11 @@ Keep responses reasonably concise unless more detail is requested.
 
     try:
         completion = await asyncio.to_thread(
-            ai_client.chat.completions.create,
+            client.chat.completions.create,
             model=AI_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
+                {"role": "user", "content": clean_prompt},
             ],
             max_tokens=1200,
         )
@@ -253,15 +287,13 @@ Keep responses reasonably concise unless more detail is requested.
         elapsed = asyncio.get_event_loop().time() - start_time
         thinking_seconds = max(1, round(elapsed))
 
-        # Guardar en el historial del canal
         ai_history[channel_id].append({
             "user": username,
-            "prompt": prompt[:300],
+            "prompt": clean_prompt[:300],
         })
 
-        # Formato exacto solicitado
         response_text = (
-            f"-# {prompt}\n"
+            f"-# {clean_prompt}\n"
             f"\"Ö\" ahh bot thought for {thinking_seconds} seconds\n"
             f"{answer}"
         )
@@ -270,7 +302,7 @@ Keep responses reasonably concise unless more detail is requested.
             await interaction.followup.send(response_text)
         else:
             await interaction.followup.send(
-                f"-# {prompt}\n"
+                f"-# {clean_prompt}\n"
                 f"\"Ö\" ahh bot thought for {thinking_seconds} seconds"
             )
             for start in range(0, len(answer), 1900):
