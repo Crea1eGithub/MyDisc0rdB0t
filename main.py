@@ -1,6 +1,10 @@
 import os
 import random
+import asyncio
+from datetime import datetime, timezone, timedelta
 from threading import Thread
+
+from openai import OpenAI
 
 import discord
 from discord import app_commands
@@ -8,6 +12,15 @@ from discord.ext import commands
 from dotenv import load_dotenv
 from flask import Flask
 
+# ============================================================
+# MyDisc0rdB0t - main.py
+# Based on the structure and commands of:
+# https://github.com/Crea1eGithub/MyDisc0rdB0t
+# ============================================================
+
+# ------------------------------------------------------------
+# Optional web server for hosts such as Render/Replit/etc.
+# ------------------------------------------------------------
 app = Flask(__name__)
 
 
@@ -32,12 +45,27 @@ def keep_alive():
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+AI_KEY = os.getenv("AI-KEY")
 
 if not TOKEN:
     raise RuntimeError(
         "DISCORD_TOKEN is not configured. "
         "Create a .env file with DISCORD_TOKEN=your_bot_token"
     )
+
+if not AI_KEY:
+    raise RuntimeError(
+        "AI-KEY is not configured. "
+        "Create a .env file with AI-KEY=your_groq_api_key"
+    )
+
+# Groq provides an OpenAI-compatible API.
+ai_client = OpenAI(
+    api_key=AI_KEY,
+    base_url="https://api.groq.com/openai/v1",
+)
+
+AI_MODEL = "openai/gpt-oss-20b"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -133,6 +161,71 @@ async def on_ready():
 # ------------------------------------------------------------
 # Commands
 # ------------------------------------------------------------
+@bot.tree.command(
+    name="ai",
+    description="Ask the AI between 06:00 and 21:00.",
+)
+@app_commands.describe(prompt="What you want to ask the AI.")
+async def ai(interaction: discord.Interaction, prompt: str):
+    # Colombia time (UTC-5), independent of the server's timezone.
+    colombia_time = datetime.now(timezone(timedelta(hours=-5)))
+
+    # Available from 06:00 inclusive until 21:00 exclusive.
+    if not 6 <= colombia_time.hour < 21:
+        await interaction.response.send_message(
+            "🤖 AI is currently offline. Available hours: **06:00–21:00**.",
+            ephemeral=True,
+        )
+        return
+
+    if not prompt.strip():
+        await interaction.response.send_message(
+            "Please provide a prompt.",
+            ephemeral=True,
+        )
+        return
+
+    # Defer while waiting for Groq.
+    await interaction.response.defer()
+
+    try:
+        completion = await asyncio.to_thread(
+            ai_client.chat.completions.create,
+            model=AI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are the AI assistant inside a Discord bot. "
+                        "Answer clearly, helpfully, and reasonably concisely."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=1200,
+        )
+
+        answer = completion.choices[0].message.content or "No response generated."
+
+        # Artificial thinking delay: longer answers take longer.
+        # Minimum 1s, ~15ms per character, maximum 20s.
+        delay = min(20.0, max(1.0, len(answer) * 0.015))
+        await asyncio.sleep(delay)
+
+        # Discord has a 2000-character message limit.
+        if len(answer) <= 2000:
+            await interaction.followup.send(answer)
+        else:
+            for start in range(0, len(answer), 1900):
+                await interaction.followup.send(answer[start:start + 1900])
+
+    except Exception as error:
+        print(f"AI request failure: {error}")
+        await interaction.followup.send(
+            "⚠️ The AI service could not process the request right now."
+        )
+
+
 @bot.tree.command(
     name="switchengesp",
     description="Toggle your interaction language between English and Español.",
