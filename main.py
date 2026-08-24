@@ -1,6 +1,7 @@
 import os
 import random
 import asyncio
+import hashlib
 from datetime import datetime, timezone, timedelta
 from threading import Thread
 from collections import defaultdict, deque
@@ -40,6 +41,7 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 AI_KEY = os.getenv("AI-KEY")
 NIGHT_OWL_KEY = os.getenv("NIGHT-OWL")
+MEMORY_SUMMARY_KEY = os.getenv("MEMORY-SUMMARY")
 
 if not TOKEN:
     raise RuntimeError(
@@ -56,6 +58,9 @@ if not AI_KEY:
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 AI_MODEL = "openai/gpt-oss-20b"
 NIGHT_OWL_PREFIX = "[night-owl=on]"
+HISTORY_LIMIT = 100
+RECENT_RAW_LIMIT = 25
+EMOJI_PROMPT_LIMIT = 80
 
 ai_client = OpenAI(
     api_key=AI_KEY,
@@ -76,9 +81,8 @@ bot = commands.Bot(
 )
 
 user_profiles: dict[int, bool] = {}
-
-# Historial de los últimos 15 /ai por canal
-ai_history: dict[int, deque] = defaultdict(lambda: deque(maxlen=15))
+ai_history: dict[int, deque] = defaultdict(lambda: deque(maxlen=HISTORY_LIMIT))
+ai_summaries: dict[int, dict] = {}
 
 LOCALIZATION = {
     False: {
@@ -105,6 +109,8 @@ LOCALIZATION = {
         "account_class": "Account Classification",
         "registry_date": "Registry Date",
         "session_init": "Guild Session Initiation",
+        "choose_empty": "Give me at least two options, separated by commas.",
+        "choose_result": "🎯 I choose: **{choice}**",
     },
     True: {
         "invalid_die": "Error de ejecución: Un dado válido debe poseer al menos 2 lados.",
@@ -130,6 +136,8 @@ LOCALIZATION = {
         "account_class": "Clasificación de la cuenta",
         "registry_date": "Fecha de registro",
         "session_init": "Inicio de sesión en el servidor",
+        "choose_empty": "Dame al menos dos opciones, separadas por comas.",
+        "choose_result": "🎯 Elijo: **{choice}**",
     },
 }
 
@@ -190,6 +198,98 @@ def make_ai_client(api_key: str) -> OpenAI:
     return OpenAI(api_key=api_key, base_url=GROQ_BASE_URL)
 
 
+def history_fingerprint(entries: list[dict]) -> str:
+    blob = "\n".join(f"{item['user']}:{item['prompt']}" for item in entries)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def format_history_lines(entries: list[dict]) -> str:
+    if not entries:
+        return "No previous /ai messages in this channel."
+    return "\n".join(f"- {item['user']}: {item['prompt']}" for item in entries)
+
+
+def format_guild_emojis(guild: discord.Guild | None) -> str:
+    if guild is None or not guild.emojis:
+        return "This chat has no custom server emojis."
+
+    emojis = list(guild.emojis)
+    lines = []
+    for emoji in emojis[:EMOJI_PROMPT_LIMIT]:
+        usage = f"<a:{emoji.name}:{emoji.id}>" if emoji.animated else f"<:{emoji.name}:{emoji.id}>"
+        kind = "animated" if emoji.animated else "static"
+        lines.append(
+            f"- name={emoji.name} | usage={usage} | type={kind} | image={emoji.url}"
+        )
+
+    extra = len(emojis) - EMOJI_PROMPT_LIMIT
+    if extra > 0:
+        lines.append(f"- ...and {extra} more custom emojis not listed.")
+
+    return "\n".join(lines)
+
+
+async def summarize_older_history(channel_id: int, older: list[dict]) -> str:
+    if not older:
+        return ""
+
+    fingerprint = history_fingerprint(older)
+    cached = ai_summaries.get(channel_id)
+    if cached and cached.get("fingerprint") == fingerprint:
+        return cached["summary"]
+
+    if not MEMORY_SUMMARY_KEY:
+        return format_history_lines(older[-20:])
+
+    client = make_ai_client(MEMORY_SUMMARY_KEY)
+    raw = format_history_lines(older)
+
+    try:
+        completion = await asyncio.to_thread(
+            client.chat.completions.create,
+            model=AI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Summarize this Discord /ai chat history for another assistant. "
+                        "Keep names, topics, decisions, and useful facts. "
+                        "Be compact. Do not invent details."
+                    ),
+                },
+                {"role": "user", "content": raw},
+            ],
+            max_tokens=500,
+        )
+        summary = completion.choices[0].message.content or format_history_lines(older[-20:])
+    except Exception as error:
+        print(f"Memory summary failure: {error}")
+        summary = format_history_lines(older[-20:])
+
+    ai_summaries[channel_id] = {
+        "fingerprint": fingerprint,
+        "summary": summary,
+    }
+    return summary
+
+
+async def build_memory_block(channel_id: int) -> str:
+    entries = list(ai_history[channel_id])
+    if not entries:
+        return "No previous /ai messages in this channel."
+
+    if len(entries) <= RECENT_RAW_LIMIT:
+        return format_history_lines(entries)
+
+    older = entries[:-RECENT_RAW_LIMIT]
+    recent = entries[-RECENT_RAW_LIMIT:]
+    summary = await summarize_older_history(channel_id, older)
+    return (
+        f"Older history summary ({len(older)} prompts):\n{summary}\n\n"
+        f"Most recent {len(recent)} prompts:\n{format_history_lines(recent)}"
+    )
+
+
 @bot.event
 async def on_ready():
     print(f"Logged in successfully as {bot.user} (ID: {bot.user.id})")
@@ -213,7 +313,7 @@ async def on_ready():
 
 @bot.tree.command(
     name="ai",
-    description="Ask the AI between 06:00 and 21:00 (Colombia). Use [night-owl=on] at night.",
+    description="Ask the AI a question. Available 06:00–21:00 UTC-5.",
 )
 @app_commands.describe(prompt="What you want to ask the AI.")
 async def ai(interaction: discord.Interaction, prompt: str):
@@ -222,8 +322,7 @@ async def ai(interaction: discord.Interaction, prompt: str):
 
     if not online and not night_owl:
         await interaction.response.send_message(
-            "🤖 AI is currently offline. Available hours: **06:00–21:00**.\n"
-            "To ask at night, start your prompt with `[night-owl=on]`.",
+            "🤖 AI is currently offline. Available hours: **06:00–21:00 UTC-5**.",
             ephemeral=True,
         )
         return
@@ -251,20 +350,21 @@ async def ai(interaction: discord.Interaction, prompt: str):
 
     channel_id = interaction.channel.id if interaction.channel else 0
     username = interaction.user.display_name
-
-    history_lines = []
-    for entry in ai_history[channel_id]:
-        history_lines.append(f"- {entry['user']}: {entry['prompt']}")
-    history_text = "\n".join(history_lines) if history_lines else "No previous /ai messages in this channel."
+    history_text = await build_memory_block(channel_id)
+    emoji_text = format_guild_emojis(interaction.guild)
 
     system_prompt = f"""You are a Discord bot AI assistant.
 Your source code is publicly available at: https://github.com/Crea1eGithub/MyDisc0rdB0t
 
 The user who just ran the /ai command is: {username}
 
-Recent /ai history in this chat (last 15 prompts):
+Recent /ai history in this chat (up to 100 prompts; older ones may be summarized):
 {history_text}
 
+Custom emojis available in this server (use the exact usage string in your reply if you want one to render):
+{emoji_text}
+
+When you want a custom emoji, write it exactly like <:name:id> or <a:name:id> for animated ones.
 Answer clearly and helpfully. You can be casual and match the user's tone when appropriate.
 Keep responses reasonably concise unless more detail is requested.
 """
@@ -292,9 +392,10 @@ Keep responses reasonably concise unless more detail is requested.
             "prompt": clean_prompt[:300],
         })
 
+        thought_line = f'**"Ö" ahh bot thought for {thinking_seconds} seconds**'
         response_text = (
             f"-# {clean_prompt}\n"
-            f"\"Ö\" ahh bot thought for {thinking_seconds} seconds\n"
+            f"{thought_line}\n"
             f"{answer}"
         )
 
@@ -302,8 +403,7 @@ Keep responses reasonably concise unless more detail is requested.
             await interaction.followup.send(response_text)
         else:
             await interaction.followup.send(
-                f"-# {clean_prompt}\n"
-                f"\"Ö\" ahh bot thought for {thinking_seconds} seconds"
+                f"-# {clean_prompt}\n{thought_line}"
             )
             for start in range(0, len(answer), 1900):
                 await interaction.followup.send(answer[start:start + 1900])
@@ -329,10 +429,32 @@ async def switchengesp(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="say", description="Echo the specified message.")
-@app_commands.describe(message="The message to repeat.")
+@bot.tree.command(name="say", description="Echo the specified message. Use $n for a new line.")
+@app_commands.describe(message="The message to repeat. Write $n to insert a line break.")
 async def say(interaction: discord.Interaction, message: str):
-    await interaction.response.send_message(message)
+    await interaction.response.send_message(message.replace("$n", "\n"))
+
+
+@bot.tree.command(
+    name="choose",
+    description="Pick one option at random. Separate options with commas.",
+)
+@app_commands.describe(options="Options separated by commas. Example: pizza, tacos, pasta")
+async def choose(interaction: discord.Interaction, options: str):
+    user_id = interaction.user.id
+    choices = [item.strip() for item in options.split(",") if item.strip()]
+
+    if len(choices) < 2:
+        await interaction.response.send_message(
+            get_string(user_id, "choose_empty"),
+            ephemeral=True,
+        )
+        return
+
+    choice = random.choice(choices)
+    await interaction.response.send_message(
+        get_string(user_id, "choose_result").format(choice=choice)
+    )
 
 
 @bot.tree.command(name="ping", description="Show the bot's current latency.")
