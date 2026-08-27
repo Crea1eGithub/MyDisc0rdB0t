@@ -17,7 +17,7 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 from flask import Flask
-
+current_year = datetime.now().year
 app = Flask(__name__)
 
 
@@ -367,6 +367,10 @@ Custom emojis available in this server (use the exact usage string in your reply
 When you want a custom emoji, write it exactly like <:name:id> or <a:name:id> for animated ones.
 Answer clearly and helpfully. You can be casual and match the user's tone when appropriate.
 Keep responses reasonably concise unless more detail is requested.
+
+I would recommend you to look for the most recent slang people use today, like, for example, "SYBAU 🥀"
+I will not tell you what it means, try to look in the internet what it means
+You are a little outdated, you are from 2024 and the current year is {current_year}, so you should try to get back, since you are a little behin
 """
 
     start_time = asyncio.get_event_loop().time()
