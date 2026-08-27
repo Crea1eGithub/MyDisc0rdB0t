@@ -354,7 +354,7 @@ async def ai(interaction: discord.Interaction, prompt: str):
     emoji_text = format_guild_emojis(interaction.guild)
 
     system_prompt = f"""You are a Discord bot AI assistant.
-Your source code is publicly available at: https://github.com/Crea1eGithub/MyDisc0rdB0t
+Your source code is publicly available at: https://github.com/Crea1eGithub/MyDisc0rdB0t/blob/main/main.py
 
 The user who just ran the /ai command is: {username}
 
