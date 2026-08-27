@@ -14,7 +14,7 @@ from PIL import Image
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from flask import Flask
 
@@ -56,11 +56,13 @@ if not AI_KEY:
     )
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-AI_MODEL = "openai/gpt-oss-20b"
+AI_MODEL = os.getenv("AI-MODEL", "groq/compound")
+SUMMARY_MODEL = os.getenv("SUMMARY-MODEL", "openai/gpt-oss-20b")
 NIGHT_OWL_PREFIX = "[night-owl=on]"
 HISTORY_LIMIT = 100
 RECENT_RAW_LIMIT = 25
 EMOJI_PROMPT_LIMIT = 80
+STATUS_ROTATE_MINUTES = 8
 
 ai_client = OpenAI(
     api_key=AI_KEY,
@@ -83,6 +85,30 @@ bot = commands.Bot(
 user_profiles: dict[int, bool] = {}
 ai_history: dict[int, deque] = defaultdict(lambda: deque(maxlen=HISTORY_LIMIT))
 ai_summaries: dict[int, dict] = {}
+
+FUN_FACTS = [
+    "Los pulpos tienen tres corazones",
+    "La miel nunca se echa a perder",
+    "Un rayo es más caliente que la superficie del Sol",
+    "Los tiburones existen desde antes que los árboles",
+    "Bananas are berries, but strawberries aren't",
+    "Un día en Venus dura más que un año en Venus",
+    "Los koalas tienen huellas dactilares casi humanas",
+    "El corazón de un camarón está en su cabeza",
+    "Hay más estrellas en el universo que granos de arena en la Tierra",
+    "Los flamencos no nacen rosados",
+    "Un caracol puede dormir hasta 3 años",
+    "Wombat poop is cube-shaped",
+    "La Torre Eiffel crece en verano",
+    "Los canguros no pueden caminar hacia atrás",
+    "Otters hold hands when they sleep",
+    "El agua caliente se congela más rápido que la fría",
+    "Los gatos no sienten el sabor dulce",
+    "There are more trees on Earth than stars in the Milky Way",
+    "Las jirafas casi no emiten sonidos",
+    "Un rayo puede calentar el aire a 30.000 °C",
+]
+_last_fact: str | None = None
 
 LOCALIZATION = {
     False: {
@@ -247,7 +273,7 @@ async def summarize_older_history(channel_id: int, older: list[dict]) -> str:
     try:
         completion = await asyncio.to_thread(
             client.chat.completions.create,
-            model=AI_MODEL,
+            model=SUMMARY_MODEL,
             messages=[
                 {
                     "role": "system",
@@ -290,25 +316,183 @@ async def build_memory_block(channel_id: int) -> str:
     )
 
 
+def pick_fun_fact() -> str:
+    global _last_fact
+    choices = [fact for fact in FUN_FACTS if fact != _last_fact] or FUN_FACTS
+    fact = random.choice(choices)
+    _last_fact = fact
+    return fact
+
+
+async def set_fun_fact_status() -> None:
+    fact = pick_fun_fact()
+    await bot.change_presence(
+        status=discord.Status.online,
+        activity=discord.CustomActivity(name=fact),
+    )
+
+
+def resolve_ai_client(night_owl: bool) -> tuple[OpenAI | None, str | None]:
+    online = is_ai_online()
+    if not online and not night_owl:
+        return None, "🤖 AI is currently offline. Available hours: **06:00–21:00 UTC-5**."
+    if night_owl and not online:
+        if not NIGHT_OWL_KEY:
+            return None, "Night Owl is not configured. Set the `NIGHT-OWL` key in the environment."
+        return make_ai_client(NIGHT_OWL_KEY), None
+    return ai_client, None
+
+
+def build_system_prompt(username: str, history_text: str, emoji_text: str) -> str:
+    current_year = datetime.now().year
+    return f"""You are a Discord bot AI assistant in {current_year}.
+Your source code: https://github.com/Crea1eGithub/MyDisc0rdB0t/blob/main/main.py
+
+You CAN search the web. Use it for current events, new slang, facts you are unsure about, and anything after your training cutoff. Do not pretend you googled something if you did not.
+
+The user talking to you is: {username}
+
+Chat history in this channel (up to 100 prompts; older ones may be summarized):
+{history_text}
+
+Custom server emojis (paste the usage string exactly if you want one to render):
+{emoji_text}
+Format: <:name:id> or <a:name:id> for animated.
+
+Style:
+- Be clear, helpful, and casual. Match the user's language (Spanish or English).
+- Keep answers reasonably short unless they ask for more.
+- You may use current internet slang when it fits, not in every sentence.
+- Useful slang (use naturally, do not lecture):
+  - aura / aura points = vibe / social credit
+  - cooked = ruined, caught, or doomed
+  - crashout = overreacting or losing it
+  - mog / mogging = completely outclassing someone
+  - pop off = doing something impressive
+  - lowkey = kinda / quietly
+  - bet = casual agreement
+  - ragebait = trying to make someone mad on purpose
+  - ahh = "that kind of" (example: cloud ahh dog)
+- If slang might have changed, search instead of guessing.
+- Do not ask every message if you used slang correctly.
+"""
+
+
+async def generate_ai_response(
+    *,
+    channel_id: int,
+    username: str,
+    guild: discord.Guild | None,
+    clean_prompt: str,
+    client: OpenAI,
+) -> tuple[str, str]:
+    history_text = await build_memory_block(channel_id)
+    emoji_text = format_guild_emojis(guild)
+    system_prompt = build_system_prompt(username, history_text, emoji_text)
+
+    start_time = asyncio.get_event_loop().time()
+    completion = await asyncio.to_thread(
+        client.chat.completions.create,
+        model=AI_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": clean_prompt},
+        ],
+        max_tokens=1200,
+    )
+    answer = completion.choices[0].message.content or "No response generated."
+    elapsed = asyncio.get_event_loop().time() - start_time
+    thinking_seconds = max(1, round(elapsed))
+
+    ai_history[channel_id].append({
+        "user": username,
+        "prompt": clean_prompt[:300],
+    })
+
+    thought_line = f'**"Ö" ahh bot thought for {thinking_seconds} seconds**'
+    return thought_line, answer
+
+
+async def send_ai_chunks(send, clean_prompt: str, thought_line: str, answer: str) -> None:
+    response_text = (
+        f"-# {clean_prompt}\n"
+        f"{thought_line}\n"
+        f"{answer}"
+    )
+    if len(response_text) <= 2000:
+        await send(response_text)
+        return
+    await send(f"-# {clean_prompt}\n{thought_line}")
+    for start in range(0, len(answer), 1900):
+        await send(answer[start:start + 1900])
+
+
+@tasks.loop(minutes=STATUS_ROTATE_MINUTES)
+async def rotate_status():
+    await set_fun_fact_status()
+
+
+@rotate_status.before_loop
+async def before_rotate_status():
+    await bot.wait_until_ready()
+
+
 @bot.event
 async def on_ready():
     print(f"Logged in successfully as {bot.user} (ID: {bot.user.id})")
+    print(f"Using AI model: {AI_MODEL}")
 
     try:
-        activity = discord.Activity(
-            type=discord.ActivityType.watching,
-            name="System Performance",
-        )
-        await bot.change_presence(
-            status=discord.Status.online,
-            activity=activity,
-        )
+        await set_fun_fact_status()
+        if not rotate_status.is_running():
+            rotate_status.start()
 
         synced = await bot.tree.sync()
         print(f"Successfully synchronized {len(synced)} application command(s).")
 
     except Exception as error:
         print(f"Synchronization failure: {error}")
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    await bot.process_commands(message)
+
+    if not isinstance(message.channel, discord.DMChannel):
+        return
+
+    prompt = (message.content or "").strip()
+    if not prompt:
+        return
+
+    night_owl, clean_prompt = parse_night_owl_prompt(prompt)
+    if not clean_prompt:
+        await message.channel.send("Please provide a prompt.")
+        return
+
+    client, error = resolve_ai_client(night_owl)
+    if error or client is None:
+        await message.channel.send(error or "The AI is unavailable.")
+        return
+
+    async with message.channel.typing():
+        try:
+            thought_line, answer = await generate_ai_response(
+                channel_id=message.channel.id,
+                username=message.author.display_name,
+                guild=None,
+                clean_prompt=clean_prompt,
+                client=client,
+            )
+            await send_ai_chunks(message.channel.send, clean_prompt, thought_line, answer)
+        except Exception as error:
+            print(f"AI DM request failure: {error}")
+            await message.channel.send(
+                "⚠️ The AI service could not process the request right now."
+            )
 
 
 @bot.tree.command(
@@ -318,15 +502,6 @@ async def on_ready():
 @app_commands.describe(prompt="What you want to ask the AI.")
 async def ai(interaction: discord.Interaction, prompt: str):
     night_owl, clean_prompt = parse_night_owl_prompt(prompt)
-    online = is_ai_online()
-    current_year = datetime.now().year
-
-    if not online and not night_owl:
-        await interaction.response.send_message(
-            "🤖 AI is currently offline. Available hours: **06:00–21:00 UTC-5**.",
-            ephemeral=True,
-        )
-        return
 
     if not clean_prompt:
         await interaction.response.send_message(
@@ -335,97 +510,25 @@ async def ai(interaction: discord.Interaction, prompt: str):
         )
         return
 
-    use_night_owl = night_owl and not online
-    if use_night_owl:
-        if not NIGHT_OWL_KEY:
-            await interaction.response.send_message(
-                "Night Owl is not configured. Set the `NIGHT-OWL` key in the environment.",
-                ephemeral=True,
-            )
-            return
-        client = make_ai_client(NIGHT_OWL_KEY)
-    else:
-        client = ai_client
+    client, error = resolve_ai_client(night_owl)
+    if error or client is None:
+        await interaction.response.send_message(
+            error or "The AI is unavailable.",
+            ephemeral=True,
+        )
+        return
 
     await interaction.response.defer()
 
-    channel_id = interaction.channel.id if interaction.channel else 0
-    username = interaction.user.display_name
-    history_text = await build_memory_block(channel_id)
-    emoji_text = format_guild_emojis(interaction.guild)
-
-    system_prompt = f"""You are a Discord bot AI assistant.
-Your source code is publicly available at: https://github.com/Crea1eGithub/MyDisc0rdB0t/blob/main/main.py
-
-The user who just ran the /ai command is: {username}
-
-Recent /ai history in this chat (up to 100 prompts; older ones may be summarized):
-{history_text}
-
-Custom emojis available in this server (use the exact usage string in your reply if you want one to render):
-{emoji_text}
-
-When you want a custom emoji, write it exactly like <:name:id> or <a:name:id> for animated ones.
-Answer clearly and helpfully. You can be casual and match the user's tone when appropriate.
-Keep responses reasonably concise unless more detail is requested.
-
-I would recommend you to look for the most recent slang people use today, like, for example, "SYBAU 🥀", which means "Shut your bitch ass up bro"
-You are a little outdated, you are from 2024 and the current year is {current_year}, so you should try to get back, since you are a little behin
-Regularly and naturally weave in current slang when appropriate:
-- Use "aura" (and reference gaining/losing aura points) to describe vibe and social credit (E.g. "-500 aura for triping over a rock in front of everyone")
-- Use "cooked" when someone is ruined, caught, or doomed.
-- Use "crashout" or "crashing out" to describe someone losing their mind, raging, or overreacting.
-- Use "mog" or "mogging" when someone completely outclasses or dominates someone else.
-- Use "pop off" when someone does something amazing or gets on a crazy streak.
-- Use "lowkenuinely" when expressing an honest but low-key opinion (it is a mix between "lowkey" and "genuinely")
-- Use "lowkey" for expressing doing something in a low tone (E.g. "I lowkey might pass the test without help")
-- Reply with "bet" for casual agreement or validation
-- Use "Ragebaiting" for baiting someone into rageing for a personal purpose, falling for it means rageing for it (E.g. "I was ragebaiting bro yesterday in minecraft, he ACTUALLY fell for it!")
-- If a user gives an over-intellectual, pretentious, or yap-heavy response, playfully hit them with "Just put the fries in the bag, bro."
-- Use "Ahh" for when something is really similar or comparable to something else (E.g. "I took like 100 photos of that "☁" ahh dog on my way home")
-- Also call the user "brochacho", "brochachito", "son", "sonion", or "enrique" when they give a really absurd or dumb/stupid response
-Regularly ask if there is a slang for something, or if you are using a slang correctly
-"""
-
-    start_time = asyncio.get_event_loop().time()
-
     try:
-        completion = await asyncio.to_thread(
-            client.chat.completions.create,
-            model=AI_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": clean_prompt},
-            ],
-            max_tokens=1200,
+        thought_line, answer = await generate_ai_response(
+            channel_id=interaction.channel.id if interaction.channel else 0,
+            username=interaction.user.display_name,
+            guild=interaction.guild,
+            clean_prompt=clean_prompt,
+            client=client,
         )
-
-        answer = completion.choices[0].message.content or "No response generated."
-
-        elapsed = asyncio.get_event_loop().time() - start_time
-        thinking_seconds = max(1, round(elapsed))
-
-        ai_history[channel_id].append({
-            "user": username,
-            "prompt": clean_prompt[:300],
-        })
-
-        thought_line = f'**"Ö" ahh bot thought for {thinking_seconds} seconds**'
-        response_text = (
-            f"-# {clean_prompt}\n"
-            f"{thought_line}\n"
-            f"{answer}"
-        )
-
-        if len(response_text) <= 2000:
-            await interaction.followup.send(response_text)
-        else:
-            await interaction.followup.send(
-                f"-# {clean_prompt}\n{thought_line}"
-            )
-            for start in range(0, len(answer), 1900):
-                await interaction.followup.send(answer[start:start + 1900])
-
+        await send_ai_chunks(interaction.followup.send, clean_prompt, thought_line, answer)
     except Exception as error:
         print(f"AI request failure: {error}")
         await interaction.followup.send(
