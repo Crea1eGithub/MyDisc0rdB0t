@@ -1,4 +1,5 @@
 import os
+import re
 import random
 import asyncio
 import hashlib
@@ -210,10 +211,13 @@ def parse_search_prompt(raw_prompt: str) -> tuple[bool, str]:
 
 def parse_night_owl_prompt(raw_prompt: str) -> tuple[bool, str]:
     stripped = raw_prompt.lstrip()
-    prefix = NIGHT_OWL_PREFIX
-    if stripped.lower().startswith(prefix.lower()):
-        cleaned = stripped[len(prefix):].lstrip()
-        return True, cleaned
+    match = re.match(
+        r"\[night[-_]?owl\s*=\s*on\]\s*",
+        stripped,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return True, stripped[match.end():].strip()
     return False, raw_prompt.strip()
 
 
