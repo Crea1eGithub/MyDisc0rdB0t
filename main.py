@@ -14,10 +14,10 @@ from PIL import Image
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from flask import Flask
-current_year = datetime.now().year
+
 app = Flask(__name__)
 
 
@@ -42,6 +42,8 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 AI_KEY = os.getenv("AI-KEY")
 NIGHT_OWL_KEY = os.getenv("NIGHT-OWL")
 MEMORY_SUMMARY_KEY = os.getenv("MEMORY-SUMMARY")
+PYTHON_ACTIVITY_ID = os.getenv("PYTHON_ACTIVITY_ID")
+PYTHON_ACTIVITY_URL = os.getenv("PYTHON_ACTIVITY_URL")
 
 if not TOKEN:
     raise RuntimeError(
@@ -56,11 +58,15 @@ if not AI_KEY:
     )
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-AI_MODEL = "openai/gpt-oss-20b"
+AI_MODEL = os.getenv("AI-MODEL", "openai/gpt-oss-20b")
+SEARCH_MODEL = os.getenv("SEARCH-MODEL", "groq/compound-mini")
+SUMMARY_MODEL = os.getenv("SUMMARY-MODEL", "openai/gpt-oss-20b")
 NIGHT_OWL_PREFIX = "[night-owl=on]"
+SEARCH_PREFIX = "[search]"
 HISTORY_LIMIT = 100
 RECENT_RAW_LIMIT = 25
 EMOJI_PROMPT_LIMIT = 80
+STATUS_ROTATE_MINUTES = 8
 
 ai_client = OpenAI(
     api_key=AI_KEY,
@@ -83,6 +89,20 @@ bot = commands.Bot(
 user_profiles: dict[int, bool] = {}
 ai_history: dict[int, deque] = defaultdict(lambda: deque(maxlen=HISTORY_LIMIT))
 ai_summaries: dict[int, dict] = {}
+
+FUN_FACTS = [
+    "Honey never spoils",
+    "Octopuses have three hearts",
+    "A day on Venus is longer than its year",
+    "Sharks are older than trees",
+    "Bananas are berries, strawberries are not",
+    "Wombats poop in cubes",
+    "Otters hold hands when they sleep",
+    "The Eiffel Tower grows in summer",
+    "Cats cannot taste sweetness",
+    "There are more trees on Earth than stars in the Milky Way",
+]
+_last_fact: str | None = None
 
 LOCALIZATION = {
     False: {
@@ -180,6 +200,14 @@ def get_string(user_id: int, key: str) -> str:
     return LOCALIZATION[is_spanish][key]
 
 
+def parse_search_prompt(raw_prompt: str) -> tuple[bool, str]:
+    stripped = raw_prompt.lstrip()
+    prefix = SEARCH_PREFIX
+    if stripped.lower().startswith(prefix.lower()):
+        return True, stripped[len(prefix):].lstrip()
+    return False, raw_prompt.strip()
+
+
 def parse_night_owl_prompt(raw_prompt: str) -> tuple[bool, str]:
     stripped = raw_prompt.lstrip()
     prefix = NIGHT_OWL_PREFIX
@@ -205,7 +233,7 @@ def history_fingerprint(entries: list[dict]) -> str:
 
 def format_history_lines(entries: list[dict]) -> str:
     if not entries:
-        return "No previous /ai messages in this channel."
+        return "No previous /talk messages in this channel."
     return "\n".join(f"- {item['user']}: {item['prompt']}" for item in entries)
 
 
@@ -247,12 +275,12 @@ async def summarize_older_history(channel_id: int, older: list[dict]) -> str:
     try:
         completion = await asyncio.to_thread(
             client.chat.completions.create,
-            model=AI_MODEL,
+            model=SUMMARY_MODEL,
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "Summarize this Discord /ai chat history for another assistant. "
+                        "Summarize this Discord /talk chat history for another assistant. "
                         "Keep names, topics, decisions, and useful facts. "
                         "Be compact. Do not invent details."
                     ),
@@ -276,7 +304,7 @@ async def summarize_older_history(channel_id: int, older: list[dict]) -> str:
 async def build_memory_block(channel_id: int) -> str:
     entries = list(ai_history[channel_id])
     if not entries:
-        return "No previous /ai messages in this channel."
+        return "No previous /talk messages in this channel."
 
     if len(entries) <= RECENT_RAW_LIMIT:
         return format_history_lines(entries)
@@ -290,75 +318,61 @@ async def build_memory_block(channel_id: int) -> str:
     )
 
 
-@bot.event
-async def on_ready():
-    print(f"Logged in successfully as {bot.user} (ID: {bot.user.id})")
-
-    try:
-        activity = discord.Activity(
-            type=discord.ActivityType.watching,
-            name="System Performance",
-        )
-        await bot.change_presence(
-            status=discord.Status.online,
-            activity=activity,
-        )
-
-        synced = await bot.tree.sync()
-        print(f"Successfully synchronized {len(synced)} application command(s).")
-
-    except Exception as error:
-        print(f"Synchronization failure: {error}")
+def pick_fun_fact() -> str:
+    global _last_fact
+    choices = [fact for fact in FUN_FACTS if fact != _last_fact] or FUN_FACTS
+    fact = random.choice(choices)
+    _last_fact = fact
+    return fact
 
 
-@bot.tree.command(
-    name="ai",
-    description="Ask the AI a question. Available 06:00–21:00 UTC-5.",
-)
-@app_commands.describe(prompt="What you want to ask the AI.")
-async def ai(interaction: discord.Interaction, prompt: str):
-    night_owl, clean_prompt = parse_night_owl_prompt(prompt)
+async def set_fun_fact_status() -> None:
+    global _last_fact
+    fact = pick_fun_fact()
+    _last_fact = fact
+    await bot.change_presence(
+        status=discord.Status.online,
+        activity=discord.CustomActivity(name=fact),
+    )
+
+
+def resolve_ai_client(night_owl: bool) -> tuple[OpenAI | None, str | None]:
     online = is_ai_online()
-
     if not online and not night_owl:
-        await interaction.response.send_message(
-            "🤖 AI is currently offline. Available hours: **06:00–21:00 UTC-5**.",
-            ephemeral=True,
-        )
-        return
-
-    if not clean_prompt:
-        await interaction.response.send_message(
-            "Please provide a prompt.",
-            ephemeral=True,
-        )
-        return
-
-    use_night_owl = night_owl and not online
-    if use_night_owl:
+        return None, "🤖 AI is currently offline. Available hours: **06:00–21:00 UTC-5**."
+    if night_owl and not online:
         if not NIGHT_OWL_KEY:
-            await interaction.response.send_message(
-                "Night Owl is not configured. Set the `NIGHT-OWL` key in the environment.",
-                ephemeral=True,
-            )
-            return
-        client = make_ai_client(NIGHT_OWL_KEY)
-    else:
-        client = ai_client
+            return None, "Night Owl is not configured. Set the `NIGHT-OWL` key in the environment."
+        return make_ai_client(NIGHT_OWL_KEY), None
+    return ai_client, None
 
-    await interaction.response.defer()
 
-    channel_id = interaction.channel.id if interaction.channel else 0
-    username = interaction.user.display_name
+async def generate_ai_response(
+    *,
+    channel_id: int,
+    username: str,
+    guild: discord.Guild | None,
+    clean_prompt: str,
+    client: OpenAI,
+    use_search: bool = False,
+) -> tuple[str, str]:
     history_text = await build_memory_block(channel_id)
-    emoji_text = format_guild_emojis(interaction.guild)
+    emoji_text = format_guild_emojis(guild)
+    model = SEARCH_MODEL if use_search else AI_MODEL
+    search_line = (
+        "You CAN search the web. Use it for current events, slang, and facts you are unsure about."
+        if use_search
+        else "You cannot browse the web in this request. Answer from what you know."
+    )
 
-    system_prompt = f"""You are a Discord bot AI, you have to act like an AI, but casually
-Your source code is publicly available at: https://github.com/Crea1eGithub/MyDisc0rdB0t/blob/main/main.py
+    system_prompt = f"""You are a Discord bot AI assistant.
+Your source code is publicly available at: https://github.com/Crea1eGithub/MyDisc0rdB0t
 
-The user who just ran the /ai command is: {username}
+The user who just talked to you is: {username}
 
-Recent /ai history in this chat (up to 100 prompts; older ones may be summarized):
+{search_line}
+
+Recent chat history in this channel (up to 100 prompts; older ones may be summarized):
 {history_text}
 
 Custom emojis available in this server (use the exact usage string in your reply if you want one to render):
@@ -367,54 +381,217 @@ Custom emojis available in this server (use the exact usage string in your reply
 When you want a custom emoji, write it exactly like <:name:id> or <a:name:id> for animated ones.
 Answer clearly and helpfully. You can be casual and match the user's tone when appropriate.
 Keep responses reasonably concise unless more detail is requested.
-
-You are a little outdated, you are from 2024 and the current year is {current_year}, so you should try to get back, since you are a little behind on technology
 """
 
     start_time = asyncio.get_event_loop().time()
+    completion = await asyncio.to_thread(
+        client.chat.completions.create,
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": clean_prompt},
+        ],
+        max_tokens=1200,
+    )
+    answer = completion.choices[0].message.content or "No response generated."
+    elapsed = asyncio.get_event_loop().time() - start_time
+    thinking_seconds = max(1, round(elapsed))
+
+    ai_history[channel_id].append({
+        "user": username,
+        "prompt": clean_prompt[:300],
+    })
+
+    thought_line = f'**"Ö" ahh bot thought for {thinking_seconds} seconds**'
+    return thought_line, answer
+
+
+async def send_ai_chunks(send, clean_prompt: str, thought_line: str, answer: str) -> None:
+    response_text = (
+        f"-# {clean_prompt}\n"
+        f"{thought_line}\n"
+        f"{answer}"
+    )
+    if len(response_text) <= 2000:
+        await send(response_text)
+        return
+    await send(f"-# {clean_prompt}\n{thought_line}")
+    for start in range(0, len(answer), 1900):
+        await send(answer[start:start + 1900])
+
+
+@tasks.loop(minutes=STATUS_ROTATE_MINUTES)
+async def rotate_status():
+    await set_fun_fact_status()
+
+
+@rotate_status.before_loop
+async def before_rotate_status():
+    await bot.wait_until_ready()
+
+
+@bot.event
+async def on_ready():
+    print(f"Logged in successfully as {bot.user} (ID: {bot.user.id})")
+    print(f"Using AI model: {AI_MODEL}")
 
     try:
-        completion = await asyncio.to_thread(
-            client.chat.completions.create,
-            model=AI_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": clean_prompt},
-            ],
-            max_tokens=1200,
-        )
+        await set_fun_fact_status()
+        if not rotate_status.is_running():
+            rotate_status.start()
 
-        answer = completion.choices[0].message.content or "No response generated."
+        synced = await bot.tree.sync()
+        print(f"Successfully synchronized {len(synced)} application command(s).")
 
-        elapsed = asyncio.get_event_loop().time() - start_time
-        thinking_seconds = max(1, round(elapsed))
+    except Exception as error:
+        print(f"Synchronization failure: {error}")
 
-        ai_history[channel_id].append({
-            "user": username,
-            "prompt": clean_prompt[:300],
-        })
 
-        thought_line = f'**"Ö" ahh bot thought for {thinking_seconds} seconds**'
-        response_text = (
-            f"-# {clean_prompt}\n"
-            f"{thought_line}\n"
-            f"{answer}"
-        )
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
 
-        if len(response_text) <= 2000:
-            await interaction.followup.send(response_text)
-        else:
-            await interaction.followup.send(
-                f"-# {clean_prompt}\n{thought_line}"
+    await bot.process_commands(message)
+
+    if message.guild is not None:
+        return
+    if not isinstance(message.channel, discord.DMChannel):
+        return
+
+    prompt = (message.content or "").strip()
+    if not prompt:
+        return
+
+    night_owl, clean_prompt = parse_night_owl_prompt(prompt)
+    use_search, clean_prompt = parse_search_prompt(clean_prompt)
+    if not clean_prompt:
+        await message.channel.send("Please provide a prompt.")
+        return
+
+    client, error = resolve_ai_client(night_owl)
+    if error or client is None:
+        await message.channel.send(error or "The AI is unavailable.")
+        return
+
+    async with message.channel.typing():
+        try:
+            thought_line, answer = await generate_ai_response(
+                channel_id=message.channel.id,
+                username=message.author.display_name,
+                guild=None,
+                clean_prompt=clean_prompt,
+                client=client,
+                use_search=use_search,
             )
-            for start in range(0, len(answer), 1900):
-                await interaction.followup.send(answer[start:start + 1900])
+            await send_ai_chunks(message.channel.send, clean_prompt, thought_line, answer)
+        except Exception as error:
+            print(f"AI DM request failure: {error}")
+            await message.channel.send(
+                "⚠️ The AI service could not process the request right now."
+            )
 
+
+@bot.tree.command(
+    name="talk",
+    description="Talk to the AI. Available 06:00–21:00 UTC-5.",
+)
+@app_commands.describe(
+    prompt="What you want to ask the AI.",
+    search="Use web search (uses Compound Mini quota). Default: off.",
+)
+async def talk(
+    interaction: discord.Interaction,
+    prompt: str,
+    search: bool = False,
+):
+    night_owl, clean_prompt = parse_night_owl_prompt(prompt)
+    tagged_search, clean_prompt = parse_search_prompt(clean_prompt)
+    use_search = search or tagged_search
+
+    if not clean_prompt:
+        await interaction.response.send_message(
+            "Please provide a prompt.",
+            ephemeral=True,
+        )
+        return
+
+    client, error = resolve_ai_client(night_owl)
+    if error or client is None:
+        await interaction.response.send_message(error or "The AI is unavailable.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    try:
+        thought_line, answer = await generate_ai_response(
+            channel_id=interaction.channel.id if interaction.channel else 0,
+            username=interaction.user.display_name,
+            guild=interaction.guild,
+            clean_prompt=clean_prompt,
+            client=client,
+            use_search=use_search,
+        )
+        await send_ai_chunks(interaction.followup.send, clean_prompt, thought_line, answer)
     except Exception as error:
         print(f"AI request failure: {error}")
         await interaction.followup.send(
             "⚠️ The AI service could not process the request right now."
         )
+
+
+@bot.tree.command(
+    name="python",
+    description="Open a Skulpt Python playground (turtle works there).",
+)
+async def python_playground(interaction: discord.Interaction):
+    activity_url = PYTHON_ACTIVITY_URL
+    activity_id = PYTHON_ACTIVITY_ID
+    view = discord.ui.View()
+
+    if activity_url:
+        view.add_item(
+            discord.ui.Button(
+                label="Open Python playground",
+                style=discord.ButtonStyle.link,
+                url=activity_url,
+            )
+        )
+
+    if (
+        activity_id
+        and interaction.guild is not None
+        and isinstance(interaction.channel, discord.abc.GuildChannel)
+    ):
+        try:
+            invite = await interaction.channel.create_invite(
+                max_age=3600,
+                max_uses=0,
+                target_type=discord.InviteTargetType.embedded_application,
+                target_application_id=int(activity_id),
+                reason="Python Skulpt activity",
+            )
+            payload = {"content": f"🐍 Python activity: {invite.url}"}
+            if activity_url:
+                payload["view"] = view
+            await interaction.response.send_message(**payload)
+            return
+        except Exception as error:
+            print(f"Python activity invite failure: {error}")
+
+    if activity_url:
+        await interaction.response.send_message(
+            "🐍 Open the Python playground to run code (including turtle) in the browser.",
+            view=view,
+        )
+        return
+
+    await interaction.response.send_message(
+        "Python playground is not configured.\n"
+        "Host `python-activity/index.html` on HTTPS, then set "
+        "`PYTHON_ACTIVITY_URL` (and optionally `PYTHON_ACTIVITY_ID` for a Discord Activity).",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(
@@ -431,10 +608,10 @@ async def switchengesp(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="say", description="Echo the specified message. Use $n for a new line.")
-@app_commands.describe(message="The message to repeat. Write $n to insert a line break.")
+@bot.tree.command(name="say", description="Echo the specified message. Use \\n for a new line.")
+@app_commands.describe(message="The message to repeat. Write \\n to insert a line break.")
 async def say(interaction: discord.Interaction, message: str):
-    await interaction.response.send_message(message.replace("$n", "\n"))
+    await interaction.response.send_message(message.replace("\\n", "\n"))
 
 
 @bot.tree.command(
