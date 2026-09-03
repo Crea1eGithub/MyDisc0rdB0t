@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Python Playground</title>
+  <script src="https://cdn.jsdelivr.net/npm/skulpt@1.2.0/dist/skulpt.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/skulpt@1.2.0/dist/skulpt-stdlib.js"></script>
+  <style>
+    :root {
+      --bg: #1e1f22;
+      --panel: #2b2d31;
+      --text: #f2f3f5;
+      --muted: #b5bac1;
+      --accent: #5865f2;
+      --ok: #23a559;
+      --err: #f23f43;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: gg sans, Whitney, "Segoe UI", sans-serif;
+    }
+    body {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      min-height: 100%;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 14px;
+      background: #111214;
+      border-bottom: 1px solid #3f4147;
+    }
+    h1 { font-size: 15px; margin: 0; font-weight: 650; }
+    .hint { color: var(--muted); font-size: 12px; }
+    .actions { margin-left: auto; display: flex; gap: 8px; }
+    button {
+      border: 0;
+      border-radius: 8px;
+      padding: 8px 12px;
+      color: white;
+      font-weight: 650;
+      cursor: pointer;
+    }
+    #run { background: var(--ok); }
+    #clear { background: #4e5058; }
+    main {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      min-height: 0;
+    }
+    textarea {
+      width: 100%;
+      height: 100%;
+      border: 0;
+      resize: none;
+      padding: 14px;
+      background: var(--panel);
+      color: var(--text);
+      font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      outline: none;
+    }
+    .right {
+      display: grid;
+      grid-template-rows: 1fr 160px;
+      min-height: 0;
+      border-left: 1px solid #3f4147;
+    }
+    #turtle {
+      background: #fff;
+      min-height: 0;
+    }
+    #output {
+      margin: 0;
+      padding: 10px 12px;
+      overflow: auto;
+      background: #111214;
+      color: #d6d8db;
+      font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre-wrap;
+    }
+    #output.error { color: #ff878b; }
+    @media (max-width: 800px) {
+      main, .right { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Python (Skulpt)</h1>
+    <span class="hint">Runs in the browser. Turtle works here.</span>
+    <div class="actions">
+      <button id="clear" type="button">Clear</button>
+      <button id="run" type="button">Run</button>
+    </div>
+  </header>
+  <main>
+    <textarea id="code" spellcheck="false">import turtle
+
+t = turtle.Turtle()
+t.speed(5)
+
+for _ in range(4):
+    t.forward(100)
+    t.right(90)
+
+print("square done")
+</textarea>
+    <div class="right">
+      <div id="turtle"></div>
+      <pre id="output">Ready. Press Run.</pre>
+    </div>
+  </main>
+  <script>
+    const output = document.getElementById("output");
+    const code = document.getElementById("code");
+    const turtle = document.getElementById("turtle");
+
+    function builtinRead(filename) {
+      if (!Sk.builtinFiles || !Sk.builtinFiles.files[filename]) {
+        throw "File not found: '" + filename + "'";
+      }
+      return Sk.builtinFiles.files[filename];
+    }
+
+    function runCode() {
+      output.textContent = "";
+      output.classList.remove("error");
+      turtle.innerHTML = "";
+      Sk.configure({
+        output: function (text) { output.textContent += text; },
+        read: builtinRead,
+        __future__: Sk.python3,
+      });
+      Sk.TurtleGraphics = Sk.TurtleGraphics || {};
+      Sk.TurtleGraphics.target = "turtle";
+      Sk.misceval.asyncToPromise(function () {
+        return Sk.importMainWithBody("<stdin>", false, code.value, true);
+      }).then(function () {
+        if (!output.textContent) output.textContent = "Finished.";
+      }).catch(function (err) {
+        output.classList.add("error");
+        output.textContent = err.toString();
+      });
+    }
+
+    document.getElementById("run").addEventListener("click", runCode);
+    document.getElementById("clear").addEventListener("click", function () {
+      output.textContent = "";
+      output.classList.remove("error");
+      turtle.innerHTML = "";
+    });
+    document.addEventListener("keydown", function (event) {
+      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+        event.preventDefault();
+        runCode();
+      }
+    });
+  </script>
+</body>
+</html>
