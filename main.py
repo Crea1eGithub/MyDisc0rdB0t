@@ -1,8 +1,9 @@
-import os
+mport os
 import re
 import random
 import asyncio
 import hashlib
+import traceback
 from datetime import datetime, timezone, timedelta
 from threading import Thread
 from collections import defaultdict, deque
@@ -29,7 +30,7 @@ def home():
 
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, use_reloader=False, threaded=True)
 
 
 def keep_alive():
@@ -434,6 +435,16 @@ async def before_rotate_status():
     await bot.wait_until_ready()
 
 
+async def sync_app_commands() -> None:
+    try:
+        synced = await asyncio.wait_for(bot.tree.sync(), timeout=20)
+        print(f"Successfully synchronized {len(synced)} application command(s).")
+    except asyncio.TimeoutError:
+        print("Command sync timed out. Using the last successful Discord command list.")
+    except Exception as error:
+        print(f"Synchronization failure: {error}")
+
+
 @bot.event
 async def on_ready():
     print(f"Logged in successfully as {bot.user} (ID: {bot.user.id})")
@@ -441,14 +452,38 @@ async def on_ready():
 
     try:
         await set_fun_fact_status()
-        if not rotate_status.is_running():
-            rotate_status.start()
-
-        synced = await bot.tree.sync()
-        print(f"Successfully synchronized {len(synced)} application command(s).")
-
     except Exception as error:
-        print(f"Synchronization failure: {error}")
+        print(f"Presence failure: {error}")
+
+    if not rotate_status.is_running():
+        rotate_status.start()
+
+    if not getattr(bot, "_command_sync_started", False):
+        bot._command_sync_started = True
+        asyncio.create_task(sync_app_commands())
+
+
+@bot.event
+async def on_error(event: str, *args, **kwargs):
+    print(f"Error in event {event}:")
+    traceback.print_exc()
+
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+):
+    print(f"Slash command error: {error}")
+    traceback.print_exc()
+    message = "That command failed. Try again in a moment."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except Exception:
+        pass
 
 
 @bot.event
@@ -546,14 +581,16 @@ async def talk(
 
 @bot.tree.command(
     name="python",
-    description="Open a Skulpt Python playground (turtle works there).",
+    description="Open the Python playground as a Discord Activity.",
 )
 async def python_playground(interaction: discord.Interaction):
-    activity_url = PYTHON_ACTIVITY_URL
-    activity_id = PYTHON_ACTIVITY_ID
-    view = discord.ui.View()
+    launched = await launch_discord_activity(interaction)
+    if launched:
+        return
 
+    activity_url = PYTHON_ACTIVITY_URL
     if activity_url:
+        view = discord.ui.View()
         view.add_item(
             discord.ui.Button(
                 label="Open Python playground",
@@ -561,41 +598,49 @@ async def python_playground(interaction: discord.Interaction):
                 url=activity_url,
             )
         )
-
-    if (
-        activity_id
-        and interaction.guild is not None
-        and isinstance(interaction.channel, discord.abc.GuildChannel)
-    ):
-        try:
-            invite = await interaction.channel.create_invite(
-                max_age=3600,
-                max_uses=0,
-                target_type=discord.InviteTargetType.embedded_application,
-                target_application_id=int(activity_id),
-                reason="Python Skulpt activity",
-            )
-            payload = {"content": f"🐍 Python activity: {invite.url}"}
-            if activity_url:
-                payload["view"] = view
-            await interaction.response.send_message(**payload)
-            return
-        except Exception as error:
-            print(f"Python activity invite failure: {error}")
-
-    if activity_url:
         await interaction.response.send_message(
-            "🐍 Open the Python playground to run code (including turtle) in the browser.",
+            "No pude abrir la Activity dentro de Discord, así que aquí va el playground en el navegador.\n"
+            "Para que se abra como Activity: Developer Portal → Activities → Enable, "
+            "y URL Mapping `/` → tu host **sin** `https://`.",
             view=view,
         )
         return
 
     await interaction.response.send_message(
-        "Python playground is not configured.\n"
-        "Host `python-activity/index.html` on HTTPS, then set "
-        "`PYTHON_ACTIVITY_URL` (and optionally `PYTHON_ACTIVITY_ID` for a Discord Activity).",
+        "La Activity no está lista.\n"
+        "1. Sube `python-activity/` a GitHub Pages (HTTPS).\n"
+        "2. Developer Portal → Activities → URL Mappings: Prefix `/` Target `tudominio.com/ruta` (sin https://).\n"
+        "3. Activa **Enable Activities**.\n"
+        "4. Opcional: `PYTHON_ACTIVITY_URL` en Render para el enlace de respaldo.",
         ephemeral=True,
     )
+
+
+async def launch_discord_activity(interaction: discord.Interaction) -> bool:
+    try:
+        launch = getattr(interaction.response, "launch_activity", None)
+        if callable(launch):
+            await launch()
+            return True
+    except Exception as error:
+        print(f"launch_activity helper failed: {error}")
+
+    try:
+        url = (
+            f"https://discord.com/api/v10/interactions/"
+            f"{interaction.id}/{interaction.token}/callback"
+        )
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json={"type": 12}) as response:
+                if response.status in (200, 204):
+                    return True
+                body = await response.text()
+                print(f"LAUNCH_ACTIVITY failed: {response.status} {body}")
+    except Exception as error:
+        print(f"LAUNCH_ACTIVITY request failed: {error}")
+
+    return False
 
 
 @bot.tree.command(
