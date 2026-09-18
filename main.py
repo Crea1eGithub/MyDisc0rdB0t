@@ -1,12 +1,14 @@
 import os
 import re
+import html as html_lib
+import json
 import random
 import asyncio
-import hashlib
 import traceback
 from datetime import datetime, timezone, timedelta
 from threading import Thread
 from collections import defaultdict, deque
+from urllib.parse import parse_qs, unquote, urlparse
 
 from openai import OpenAI
 from io import BytesIO
@@ -61,14 +63,41 @@ if not AI_KEY:
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 AI_MODEL = os.getenv("AI-MODEL", "openai/gpt-oss-20b")
-SEARCH_MODEL = os.getenv("SEARCH-MODEL", "groq/compound-mini")
 SUMMARY_MODEL = os.getenv("SUMMARY-MODEL", "openai/gpt-oss-20b")
 NIGHT_OWL_PREFIX = "[night-owl=on]"
-SEARCH_PREFIX = "[search]"
+DEEP_SEARCH_PREFIX = "[deep_search=on]"
 HISTORY_LIMIT = 100
-RECENT_RAW_LIMIT = 25
-EMOJI_PROMPT_LIMIT = 80
+RECENT_PROMPT_LIMIT = 8
+OLDER_SNIPPET_LIMIT = 10
+SNIPPET_CHARS = 72
+PROMPT_STORE_CHARS = 160
+EMOJI_PROMPT_LIMIT = 12
+MAX_ANSWER_TOKENS = 700
 STATUS_ROTATE_MINUTES = 8
+MEMORY_FILE = os.getenv("MEMORY_FILE", "memory.json")
+MEMORY_CHANNEL_ID = os.getenv("MEMORY_CHANNEL_ID")
+OWNER_USERNAMES = {
+    name.strip().lower()
+    for name in os.getenv("OWNER_USERNAMES", "crea1e").split(",")
+    if name.strip()
+}
+OWNER_USER_IDS = {
+    int(value)
+    for value in os.getenv("OWNER_USER_IDS", "").split(",")
+    if value.strip().isdigit()
+}
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+TALK_USER_DAILY_LIMIT = env_int("TALK_USER_DAILY_LIMIT", 12)
+TALK_GLOBAL_DAILY_LIMIT = env_int("TALK_GLOBAL_DAILY_LIMIT", 200)
+TALK_COOLDOWN_SECONDS = env_int("TALK_COOLDOWN_SECONDS", 15)
 
 ai_client = OpenAI(
     api_key=AI_KEY,
@@ -91,6 +120,185 @@ bot = commands.Bot(
 user_profiles: dict[int, bool] = {}
 ai_history: dict[int, deque] = defaultdict(lambda: deque(maxlen=HISTORY_LIMIT))
 ai_summaries: dict[int, dict] = {}
+talk_usage: dict = {
+    "day": "",
+    "global": 0,
+    "users": {},
+    "last": {},
+}
+_memory_lock: asyncio.Lock | None = None
+
+
+def get_memory_lock() -> asyncio.Lock:
+    global _memory_lock
+    if _memory_lock is None:
+        _memory_lock = asyncio.Lock()
+    return _memory_lock
+
+
+def memory_payload() -> dict:
+    return {
+        "history": {
+            str(channel_id): list(entries)
+            for channel_id, entries in ai_history.items()
+        },
+        "summaries": {
+            str(channel_id): data
+            for channel_id, data in ai_summaries.items()
+        },
+        "talk_usage": talk_usage,
+    }
+
+
+def apply_memory_payload(payload: dict, source: str) -> None:
+    if not isinstance(payload, dict):
+        return
+
+    for key, entries in (payload.get("history") or {}).items():
+        try:
+            channel_id = int(key)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(entries, list):
+            continue
+        cleaned = []
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            user = str(item.get("user", "unknown"))
+            prompt = str(item.get("prompt", ""))[:PROMPT_STORE_CHARS]
+            if prompt:
+                cleaned.append({"user": user, "prompt": prompt})
+        ai_history[channel_id] = deque(cleaned, maxlen=HISTORY_LIMIT)
+
+    for key, summary in (payload.get("summaries") or {}).items():
+        try:
+            channel_id = int(key)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(summary, dict) and summary.get("summary"):
+            ai_summaries[channel_id] = {
+                "fingerprint": str(summary.get("fingerprint", "")),
+                "summary": str(summary.get("summary", "")),
+            }
+
+    saved_usage = payload.get("talk_usage")
+    if isinstance(saved_usage, dict):
+        talk_usage["day"] = str(saved_usage.get("day", ""))
+        try:
+            talk_usage["global"] = int(saved_usage.get("global", 0))
+        except (TypeError, ValueError):
+            talk_usage["global"] = 0
+        users = saved_usage.get("users") or {}
+        last = saved_usage.get("last") or {}
+        talk_usage["users"] = {
+            str(key): int(value)
+            for key, value in users.items()
+            if str(value).lstrip("-").isdigit()
+        }
+        talk_usage["last"] = {
+            str(key): float(value)
+            for key, value in last.items()
+            if isinstance(value, (int, float, str))
+        }
+
+    print(
+        f"Loaded AI memory: {sum(len(v) for v in ai_history.values())} prompts "
+        f"across {len(ai_history)} chats from {source}"
+    )
+
+
+def load_memory() -> None:
+    if not os.path.isfile(MEMORY_FILE):
+        return
+    try:
+        with open(MEMORY_FILE, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception as error:
+        print(f"Memory load failure: {error}")
+        return
+    apply_memory_payload(payload, MEMORY_FILE)
+
+
+def dump_memory() -> None:
+    payload = memory_payload()
+    directory = os.path.dirname(os.path.abspath(MEMORY_FILE))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    temp_path = MEMORY_FILE + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False)
+    os.replace(temp_path, MEMORY_FILE)
+
+
+def memory_channel_id() -> int | None:
+    if not MEMORY_CHANNEL_ID:
+        return None
+    try:
+        return int(MEMORY_CHANNEL_ID)
+    except ValueError:
+        print("MEMORY_CHANNEL_ID must be a numeric channel id.")
+        return None
+
+
+async def load_memory_from_discord() -> None:
+    channel_id = memory_channel_id()
+    if channel_id is None:
+        return
+    channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+    async for message in channel.history(limit=30):
+        if message.author.id != bot.user.id:
+            continue
+        attachment = next(
+            (item for item in message.attachments if item.filename == "memory.json"),
+            None,
+        )
+        if attachment is None:
+            continue
+        raw = await attachment.read()
+        payload = json.loads(raw.decode("utf-8"))
+        apply_memory_payload(payload, f"discord:{channel_id}")
+        return
+    print("No Discord memory.json found yet. It will be created on the next /talk.")
+
+
+async def save_memory_to_discord() -> None:
+    channel_id = memory_channel_id()
+    if channel_id is None:
+        return
+    channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+    payload = json.dumps(memory_payload(), ensure_ascii=False).encode("utf-8")
+    upload = discord.File(BytesIO(payload), filename="memory.json")
+    await channel.send(
+        content="AI memory snapshot (do not delete this channel).",
+        file=upload,
+    )
+    old_messages = []
+    async for message in channel.history(limit=30):
+        if message.author.id != bot.user.id:
+            continue
+        if any(item.filename == "memory.json" for item in message.attachments):
+            old_messages.append(message)
+    for message in old_messages[1:]:
+        try:
+            await message.delete()
+        except Exception:
+            break
+
+
+async def save_memory() -> None:
+    async with get_memory_lock():
+        try:
+            await asyncio.to_thread(dump_memory)
+        except Exception as error:
+            print(f"Memory save failure: {error}")
+        try:
+            await save_memory_to_discord()
+        except Exception as error:
+            print(f"Discord memory save failure: {error}")
+
+
+load_memory()
 
 FUN_FACTS = [
     "Honey never spoils",
@@ -202,44 +410,287 @@ def get_string(user_id: int, key: str) -> str:
     return LOCALIZATION[is_spanish][key]
 
 
-def parse_search_prompt(raw_prompt: str) -> tuple[bool, str]:
-    stripped = raw_prompt.lstrip()
-    prefix = SEARCH_PREFIX
-    if stripped.lower().startswith(prefix.lower()):
-        return True, stripped[len(prefix):].lstrip()
-    return False, raw_prompt.strip()
-
-
 def parse_night_owl_prompt(raw_prompt: str) -> tuple[bool, str]:
-    stripped = raw_prompt.lstrip()
-    match = re.match(
-        r"\[night[-_]?owl\s*=\s*on\]\s*",
-        stripped,
-        flags=re.IGNORECASE,
-    )
-    if match:
-        return True, stripped[match.end():].strip()
-    return False, raw_prompt.strip()
+    night_owl, deep_search, clean = strip_prompt_flags(raw_prompt)
+    return night_owl, clean
+
+
+def strip_prompt_flags(raw_prompt: str) -> tuple[bool, bool, str]:
+    text = raw_prompt.lstrip()
+    night_owl = False
+    deep_search = False
+    while True:
+        match = re.match(r"\[night[-_]?owl\s*=\s*on\]\s*", text, flags=re.IGNORECASE)
+        if match:
+            night_owl = True
+            text = text[match.end():]
+            continue
+        match = re.match(r"\[deep[-_]?search\s*=\s*on\]\s*", text, flags=re.IGNORECASE)
+        if match:
+            deep_search = True
+            text = text[match.end():]
+            continue
+        match = re.match(r"\[groq/compound\s*=\s*on\]\s*", text, flags=re.IGNORECASE)
+        if match:
+            deep_search = True
+            text = text[match.end():]
+            continue
+        match = re.match(r"\[search\]\s*", text, flags=re.IGNORECASE)
+        if match:
+            text = text[match.end():]
+            continue
+        break
+    return night_owl, deep_search, text.strip()
+
+
+FRESH_INFO_RE = re.compile(
+    r"\b("
+    r"202[4-9]|203\d|"
+    r"hoy|ahora|actual(?:es|idad|izado)?|reciente(?:mente|s)?|"
+    r"este a[nñ]o|noticias?|[uú]ltim[oa]s?|qui[eé]n gan[oó]|"
+    r"latest|current|today|tonight|this year|right now|who won|breaking"
+    r")\b",
+    flags=re.IGNORECASE,
+)
+
+
+def needs_fresh_info(prompt: str) -> bool:
+    return bool(FRESH_INFO_RE.search(prompt or ""))
+
+
+_search_cache: dict[str, tuple[float, str]] = {}
+
+
+def cache_search(query: str, snippets: str) -> None:
+    _search_cache[query.lower()[:200]] = (asyncio.get_event_loop().time(), snippets)
+    if len(_search_cache) > 40:
+        oldest = min(_search_cache, key=lambda key: _search_cache[key][0])
+        _search_cache.pop(oldest, None)
+
+
+def cached_search(query: str) -> str | None:
+    item = _search_cache.get(query.lower()[:200])
+    if not item:
+        return None
+    stored_at, snippets = item
+    if asyncio.get_event_loop().time() - stored_at > 900:
+        return None
+    return snippets
+
+
+def unwrap_ddg_url(url: str) -> str:
+    if not url:
+        return url
+    if url.startswith("//"):
+        url = "https:" + url
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    if "uddg" in query:
+        return unquote(query["uddg"][0])
+    return url
+
+
+def strip_html_text(raw: str) -> str:
+    raw = re.sub(r"<script[\s\S]*?</script>", " ", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"<style[\s\S]*?</style>", " ", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"<[^>]+>", " ", raw)
+    raw = html_lib.unescape(re.sub(r"\s+", " ", raw)).strip()
+    return raw
+
+
+async def fetch_page_extract(session: aiohttp.ClientSession, url: str) -> str:
+    url = unwrap_ddg_url(url)
+    if not url.startswith("http://") and not url.startswith("https://"):
+        return ""
+    try:
+        async with session.get(url, allow_redirects=True) as response:
+            if response.status != 200:
+                return ""
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            if "html" not in content_type and "text" not in content_type:
+                return ""
+            raw = await response.text(errors="ignore")
+        text = strip_html_text(raw)
+        return text[:1200]
+    except Exception as error:
+        print(f"Page extract failure: {error}")
+        return ""
+
+
+async def fetch_web_context(query: str, deep: bool = False) -> str:
+    cache_key = ("deep:" if deep else "lite:") + query
+    cached = cached_search(cache_key)
+    if cached:
+        return cached
+
+    snippets: list[str] = []
+    page_urls: list[str] = []
+    timeout = aiohttp.ClientTimeout(total=12 if deep else 8)
+    headers = {"User-Agent": "MyDisc0rdB0t/1.0 (educational Discord bot)"}
+    wiki_limit = "5" if deep else "3"
+    ddg_limit = 12 if deep else 8
+
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        for wiki in (
+            "https://es.wikipedia.org/w/api.php",
+            "https://en.wikipedia.org/w/api.php",
+        ):
+            try:
+                async with session.get(
+                    wiki,
+                    params={
+                        "action": "opensearch",
+                        "search": query[:200],
+                        "limit": wiki_limit,
+                        "namespace": "0",
+                        "format": "json",
+                    },
+                ) as response:
+                    if response.status != 200:
+                        continue
+                    data = await response.json()
+                    titles = data[1] if len(data) > 1 else []
+                    descs = data[2] if len(data) > 2 else []
+                    urls = data[3] if len(data) > 3 else []
+                    for index, title in enumerate(titles):
+                        desc = descs[index] if index < len(descs) else ""
+                        url = urls[index] if index < len(urls) else ""
+                        snippets.append(f"- {title}: {desc} {url}".strip())
+                        if url:
+                            page_urls.append(url)
+            except Exception as error:
+                print(f"Wikipedia search failure: {error}")
+
+        try:
+            async with session.get(
+                "https://html.duckduckgo.com/html/",
+                params={"q": query[:200]},
+            ) as response:
+                page = await response.text() if response.status == 200 else ""
+            for match in re.finditer(
+                r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+                page,
+                flags=re.IGNORECASE | re.DOTALL,
+            ):
+                url = html_lib.unescape(re.sub(r"\s+", " ", match.group(1))).strip()
+                title = html_lib.unescape(re.sub(r"<[^>]+>", "", match.group(2)))
+                title = re.sub(r"\s+", " ", title).strip()
+                resolved = unwrap_ddg_url(url)
+                if title:
+                    snippets.append(f"- {title} ({resolved})")
+                if resolved.startswith("http"):
+                    page_urls.append(resolved)
+                if len(snippets) >= ddg_limit + 6:
+                    break
+        except Exception as error:
+            print(f"DuckDuckGo search failure: {error}")
+
+        if deep:
+            unique_pages = []
+            seen_pages = set()
+            for url in page_urls:
+                host = urlparse(url).netloc.lower()
+                if not host or host in seen_pages:
+                    continue
+                seen_pages.add(host)
+                unique_pages.append(url)
+                if len(unique_pages) >= 3:
+                    break
+            extracts = await asyncio.gather(
+                *[fetch_page_extract(session, url) for url in unique_pages],
+                return_exceptions=True,
+            )
+            for url, extract in zip(unique_pages, extracts):
+                if isinstance(extract, str) and extract:
+                    snippets.append(f"- Extract from {url}: {extract}")
+
+    unique: list[str] = []
+    seen = set()
+    for line in snippets:
+        if line in seen:
+            continue
+        seen.add(line)
+        unique.append(line)
+
+    result = "\n".join(unique[: (14 if deep else 8)]) or "No web results found."
+    cache_search(cache_key, result)
+    return result
+
+
+def colombia_now() -> datetime:
+    return datetime.now(timezone(timedelta(hours=-5)))
 
 
 def is_ai_online() -> bool:
-    colombia_time = datetime.now(timezone(timedelta(hours=-5)))
-    return 6 <= colombia_time.hour < 21
+    return 6 <= colombia_now().hour < 21
+
+
+def is_owner(user: discord.abc.User) -> bool:
+    return user.id in OWNER_USER_IDS or (user.name or "").lower() in OWNER_USERNAMES
+
+
+def reset_talk_usage_if_needed() -> None:
+    today = colombia_now().strftime("%Y-%m-%d")
+    if talk_usage.get("day") != today:
+        talk_usage["day"] = today
+        talk_usage["global"] = 0
+        talk_usage["users"] = {}
+        talk_usage["last"] = {}
+
+
+def check_talk_quota(user: discord.abc.User) -> str | None:
+    reset_talk_usage_if_needed()
+    if is_owner(user):
+        return None
+    user_key = str(user.id)
+    last = talk_usage["last"].get(user_key)
+    now = colombia_now().timestamp()
+    if last is not None:
+        try:
+            elapsed = now - float(last)
+        except (TypeError, ValueError):
+            elapsed = TALK_COOLDOWN_SECONDS
+        if elapsed < TALK_COOLDOWN_SECONDS:
+            wait = max(1, int(TALK_COOLDOWN_SECONDS - elapsed))
+            return f"⏳ Espera **{wait}s** antes de volver a usar la IA."
+    used = int(talk_usage["users"].get(user_key, 0))
+    if used >= TALK_USER_DAILY_LIMIT:
+        return (
+            f"⛔ Llegaste a tu límite de **{TALK_USER_DAILY_LIMIT}** mensajes de IA hoy. "
+            "Se reinicia a las **00:00 UTC-5**."
+        )
+    if int(talk_usage["global"]) >= TALK_GLOBAL_DAILY_LIMIT:
+        return (
+            "⛔ El bot llegó al límite global de IA de hoy. "
+            "Se reinicia a las **00:00 UTC-5**."
+        )
+    return None
+
+
+def consume_talk_quota(user: discord.abc.User) -> None:
+    reset_talk_usage_if_needed()
+    if is_owner(user):
+        return
+    user_key = str(user.id)
+    talk_usage["users"][user_key] = int(talk_usage["users"].get(user_key, 0)) + 1
+    talk_usage["global"] = int(talk_usage["global"]) + 1
+    talk_usage["last"][user_key] = colombia_now().timestamp()
 
 
 def make_ai_client(api_key: str) -> OpenAI:
     return OpenAI(api_key=api_key, base_url=GROQ_BASE_URL)
 
 
-def history_fingerprint(entries: list[dict]) -> str:
-    blob = "\n".join(f"{item['user']}:{item['prompt']}" for item in entries)
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
-
-
-def format_history_lines(entries: list[dict]) -> str:
+def format_history_lines(entries: list[dict], limit_chars: int | None = None) -> str:
     if not entries:
         return "No previous /talk messages in this channel."
-    return "\n".join(f"- {item['user']}: {item['prompt']}" for item in entries)
+    lines = []
+    for item in entries:
+        prompt = item["prompt"].replace("\n", " ")
+        if limit_chars is not None:
+            prompt = prompt[:limit_chars]
+        lines.append(f"- {item['user']}: {prompt}")
+    return "\n".join(lines)
 
 
 def format_guild_emojis(guild: discord.Guild | None) -> str:
@@ -262,64 +713,22 @@ def format_guild_emojis(guild: discord.Guild | None) -> str:
     return "\n".join(lines)
 
 
-async def summarize_older_history(channel_id: int, older: list[dict]) -> str:
-    if not older:
-        return ""
-
-    fingerprint = history_fingerprint(older)
-    cached = ai_summaries.get(channel_id)
-    if cached and cached.get("fingerprint") == fingerprint:
-        return cached["summary"]
-
-    if not MEMORY_SUMMARY_KEY:
-        return format_history_lines(older[-20:])
-
-    client = make_ai_client(MEMORY_SUMMARY_KEY)
-    raw = format_history_lines(older)
-
-    try:
-        completion = await asyncio.to_thread(
-            client.chat.completions.create,
-            model=SUMMARY_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Summarize this Discord /talk chat history for another assistant. "
-                        "Keep names, topics, decisions, and useful facts. "
-                        "Be compact. Do not invent details."
-                    ),
-                },
-                {"role": "user", "content": raw},
-            ],
-            max_tokens=500,
-        )
-        summary = completion.choices[0].message.content or format_history_lines(older[-20:])
-    except Exception as error:
-        print(f"Memory summary failure: {error}")
-        summary = format_history_lines(older[-20:])
-
-    ai_summaries[channel_id] = {
-        "fingerprint": fingerprint,
-        "summary": summary,
-    }
-    return summary
-
-
 async def build_memory_block(channel_id: int) -> str:
     entries = list(ai_history[channel_id])
     if not entries:
         return "No previous /talk messages in this channel."
 
-    if len(entries) <= RECENT_RAW_LIMIT:
-        return format_history_lines(entries)
+    recent = entries[-RECENT_PROMPT_LIMIT:]
+    older = entries[:-RECENT_PROMPT_LIMIT]
+    if not older:
+        return format_history_lines(recent, PROMPT_STORE_CHARS)
 
-    older = entries[:-RECENT_RAW_LIMIT]
-    recent = entries[-RECENT_RAW_LIMIT:]
-    summary = await summarize_older_history(channel_id, older)
+    older_tail = older[-OLDER_SNIPPET_LIMIT:]
     return (
-        f"Older history summary ({len(older)} prompts):\n{summary}\n\n"
-        f"Most recent {len(recent)} prompts:\n{format_history_lines(recent)}"
+        f"Older prompts ({len(older)} stored, showing last {len(older_tail)}, shortened):\n"
+        f"{format_history_lines(older_tail, SNIPPET_CHARS)}\n\n"
+        f"Most recent {len(recent)}:\n"
+        f"{format_history_lines(recent, PROMPT_STORE_CHARS)}"
     )
 
 
@@ -360,15 +769,30 @@ async def generate_ai_response(
     clean_prompt: str,
     client: OpenAI,
     use_search: bool = False,
+    deep_search: bool = False,
 ) -> tuple[str, str]:
     history_text = await build_memory_block(channel_id)
     emoji_text = format_guild_emojis(guild)
-    model = SEARCH_MODEL if use_search else AI_MODEL
-    search_line = (
-        "You CAN search the web. Use it for current events, slang, and facts you are unsure about."
-        if use_search
-        else "You cannot browse the web in this request. Answer from what you know."
-    )
+    web_context = ""
+    if deep_search or use_search:
+        web_context = await fetch_web_context(clean_prompt, deep=deep_search)
+        search_line = (
+            "Web snippets were fetched for you with DuckDuckGo/Wikipedia"
+            + (" and page extracts" if deep_search else "")
+            + ". Use them if relevant. Do not invent sources. "
+            "Prefer these snippets for anything from 2024 onward."
+        )
+    else:
+        search_line = (
+            "You cannot browse the web in this request. Answer from what you know. "
+            "If the user needs facts from 2024 onward, say you may be outdated."
+        )
+
+    user_message = clean_prompt
+    if web_context:
+        user_message = (
+            f"{clean_prompt}\n\nWeb snippets (may be incomplete):\n{web_context}"
+        )
 
     system_prompt = f"""You are a Discord bot AI assistant.
 Your source code is publicly available at: https://github.com/Crea1eGithub/MyDisc0rdB0t
@@ -377,7 +801,7 @@ The user who just talked to you is: {username}
 
 {search_line}
 
-Recent chat history in this channel (up to 100 prompts; older ones may be summarized):
+Recent chat history in this channel (saved on disk; only a short recap is included here):
 {history_text}
 
 Custom emojis available in this server (use the exact usage string in your reply if you want one to render):
@@ -391,12 +815,12 @@ Keep responses reasonably concise unless more detail is requested.
     start_time = asyncio.get_event_loop().time()
     completion = await asyncio.to_thread(
         client.chat.completions.create,
-        model=model,
+        model=AI_MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": clean_prompt},
+            {"role": "user", "content": user_message},
         ],
-        max_tokens=1200,
+        max_tokens=MAX_ANSWER_TOKENS,
     )
     answer = completion.choices[0].message.content or "No response generated."
     elapsed = asyncio.get_event_loop().time() - start_time
@@ -404,8 +828,9 @@ Keep responses reasonably concise unless more detail is requested.
 
     ai_history[channel_id].append({
         "user": username,
-        "prompt": clean_prompt[:300],
+        "prompt": clean_prompt[:PROMPT_STORE_CHARS],
     })
+    await save_memory()
 
     thought_line = f'**"Ö" ahh bot thought for {thinking_seconds} seconds**'
     return thought_line, answer
@@ -462,6 +887,11 @@ async def on_ready():
         bot._command_sync_started = True
         asyncio.create_task(sync_app_commands())
 
+    try:
+        await load_memory_from_discord()
+    except Exception as error:
+        print(f"Discord memory load failure: {error}")
+
 
 @bot.event
 async def on_error(event: str, *args, **kwargs):
@@ -502,16 +932,25 @@ async def on_message(message: discord.Message):
     if not prompt:
         return
 
-    night_owl, clean_prompt = parse_night_owl_prompt(prompt)
-    use_search, clean_prompt = parse_search_prompt(clean_prompt)
+    night_owl, deep_search, clean_prompt = strip_prompt_flags(prompt)
     if not clean_prompt:
         await message.channel.send("Please provide a prompt.")
+        return
+
+    use_search = deep_search or needs_fresh_info(clean_prompt)
+
+    quota_error = check_talk_quota(message.author)
+    if quota_error:
+        await message.channel.send(quota_error)
         return
 
     client, error = resolve_ai_client(night_owl)
     if error or client is None:
         await message.channel.send(error or "The AI is unavailable.")
         return
+
+    consume_talk_quota(message.author)
+    await save_memory()
 
     async with message.channel.typing():
         try:
@@ -522,6 +961,7 @@ async def on_message(message: discord.Message):
                 clean_prompt=clean_prompt,
                 client=client,
                 use_search=use_search,
+                deep_search=deep_search,
             )
             await send_ai_chunks(message.channel.send, clean_prompt, thought_line, answer)
         except Exception as error:
@@ -537,16 +977,15 @@ async def on_message(message: discord.Message):
 )
 @app_commands.describe(
     prompt="What you want to ask the AI.",
-    search="Use web search (uses Compound Mini quota). Default: off.",
+    deep_search="Read a few web pages (still 1 Groq call). Default: off.",
 )
 async def talk(
     interaction: discord.Interaction,
     prompt: str,
-    search: bool = False,
+    deep_search: bool = False,
 ):
-    night_owl, clean_prompt = parse_night_owl_prompt(prompt)
-    tagged_search, clean_prompt = parse_search_prompt(clean_prompt)
-    use_search = search or tagged_search
+    night_owl, tagged_deep, clean_prompt = strip_prompt_flags(prompt)
+    deep_search = deep_search or tagged_deep
 
     if not clean_prompt:
         await interaction.response.send_message(
@@ -555,11 +994,20 @@ async def talk(
         )
         return
 
+    use_search = deep_search or needs_fresh_info(clean_prompt)
+
+    quota_error = check_talk_quota(interaction.user)
+    if quota_error:
+        await interaction.response.send_message(quota_error, ephemeral=True)
+        return
+
     client, error = resolve_ai_client(night_owl)
     if error or client is None:
         await interaction.response.send_message(error or "The AI is unavailable.", ephemeral=True)
         return
 
+    consume_talk_quota(interaction.user)
+    await save_memory()
     await interaction.response.defer()
 
     try:
@@ -570,6 +1018,7 @@ async def talk(
             clean_prompt=clean_prompt,
             client=client,
             use_search=use_search,
+            deep_search=deep_search,
         )
         await send_ai_chunks(interaction.followup.send, clean_prompt, thought_line, answer)
     except Exception as error:
