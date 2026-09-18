@@ -1,125 +1,216 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="es">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Python Playground</title>
   <style>
     :root {
-      --bg: #1e1f22;
-      --panel: #2b2d31;
-      --text: #f2f3f5;
-      --muted: #b5bac1;
-      --accent: #5865f2;
-      --ok: #23a559;
-      --err: #f23f43;
+      --bg: #120f24;
+      --panel: #1c1833;
+      --panel-2: #16132b;
+      --line: #3a3470;
+      --text: #f4f1ff;
+      --muted: #b7b0d9;
+      --purple: #7b5cff;
+      --purple-2: #9d86ff;
+      --run: #00c46a;
+      --stop: #ff5c7a;
+      --console: #0d0b1a;
+      --stage: #ffffff;
     }
     * { box-sizing: border-box; }
     html, body {
       margin: 0;
       height: 100%;
-      background: var(--bg);
+      background:
+        radial-gradient(1200px 500px at 10% -10%, #3b2a7a55, transparent),
+        var(--bg);
       color: var(--text);
-      font-family: gg sans, Whitney, "Segoe UI", sans-serif;
+      font-family: "Nunito", "Trebuchet MS", "Segoe UI", sans-serif;
     }
     body {
       display: grid;
-      grid-template-rows: auto 1fr;
+      grid-template-rows: 58px 1fr 168px;
       min-height: 100%;
     }
     header {
       display: flex;
       align-items: center;
       gap: 12px;
-      padding: 10px 14px;
-      background: #111214;
-      border-bottom: 1px solid #3f4147;
+      padding: 0 14px;
+      background: linear-gradient(90deg, #221b45, #1a1634);
+      border-bottom: 1px solid var(--line);
     }
-    h1 { font-size: 15px; margin: 0; font-weight: 650; }
+    .logo {
+      width: 34px;
+      height: 34px;
+      border-radius: 12px;
+      display: grid;
+      place-items: center;
+      background: linear-gradient(180deg, var(--purple-2), var(--purple));
+      font-weight: 800;
+      box-shadow: 0 6px 16px #7b5cff55;
+    }
+    h1 { font-size: 16px; margin: 0; font-weight: 800; letter-spacing: 0.2px; }
     .hint { color: var(--muted); font-size: 12px; }
     .actions { margin-left: auto; display: flex; gap: 8px; }
     button {
       border: 0;
-      border-radius: 8px;
-      padding: 8px 12px;
+      border-radius: 12px;
+      padding: 9px 14px;
       color: white;
-      font-weight: 650;
+      font-weight: 800;
       cursor: pointer;
+      font-family: inherit;
     }
-    #run { background: var(--ok); }
-    #clear { background: #4e5058; }
+    #run { background: var(--run); color: #042614; }
+    #stop { background: var(--stop); display: none; }
+    #clear { background: #3a3470; }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
     main {
       display: grid;
-      grid-template-columns: 1.1fr 0.9fr;
+      grid-template-columns: 1.15fr 0.85fr;
       min-height: 0;
     }
-    textarea {
-      width: 100%;
-      height: 100%;
-      border: 0;
-      resize: none;
-      padding: 14px;
-      background: var(--panel);
-      color: var(--text);
-      font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      outline: none;
-    }
-    .right {
+    .editor-wrap, .stage-wrap {
+      min-height: 0;
       display: grid;
-      grid-template-rows: 1fr 160px;
+      grid-template-rows: auto 1fr;
+    }
+    .label {
+      padding: 7px 12px;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--purple-2);
+      background: var(--panel-2);
+      border-bottom: 1px solid var(--line);
+    }
+    .CodeMirror {
+      height: 100%;
+      font-size: 14px;
+      line-height: 1.5;
+      background: var(--panel) !important;
+    }
+    .stage-wrap { border-left: 1px solid var(--line); }
+    .stage-frame {
+      padding: 14px;
+      background: #241f46;
       min-height: 0;
-      border-left: 1px solid #3f4147;
     }
     #turtle {
-      background: #fff;
+      height: 100%;
+      background: var(--stage);
+      border-radius: 18px;
+      overflow: hidden;
+      box-shadow: 0 12px 30px #00000055;
+      outline: none;
+    }
+    #turtle canvas { display: block; }
+    .console {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      background: var(--console);
+      border-top: 1px solid var(--line);
       min-height: 0;
     }
     #output {
       margin: 0;
-      padding: 10px 12px;
+      padding: 8px 12px;
       overflow: auto;
-      background: #111214;
-      color: #d6d8db;
-      font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #d8d3ff;
+      font: 13px/1.45 ui-monospace, "Segoe UI", "Noto Sans", Consolas, monospace;
       white-space: pre-wrap;
     }
-    #output.error { color: #ff878b; }
-    @media (max-width: 800px) {
-      main, .right { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
+    #output.error { color: #ff9aa9; }
+    #stdin {
+      width: 100%;
+      min-height: 54px;
+      max-height: 90px;
+      resize: none;
+      border: 0;
+      border-top: 1px solid var(--line);
+      padding: 10px 12px;
+      background: #15122a;
+      color: var(--text);
+      font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      outline: none;
+    }
+    #stdin:focus { box-shadow: inset 0 0 0 2px var(--purple); }
+    #stdin:disabled { opacity: 0.55; }
+    @media (max-width: 860px) {
+      body { grid-template-rows: 52px 1fr 1fr 180px; }
+      main { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
+      .stage-wrap { border-left: 0; border-top: 1px solid var(--line); }
     }
   </style>
 </head>
 <body>
   <header>
-    <h1>Python (Skulpt)</h1>
-    <span class="hint">Runs in the browser. Turtle works here.</span>
+    <div class="logo">Py</div>
+    <div>
+      <h1>Python Playground</h1>
+      <div class="hint">Stage + console · Enter sends input()</div>
+    </div>
     <div class="actions">
       <button id="clear" type="button">Clear</button>
+      <button id="stop" type="button">Stop</button>
       <button id="run" type="button">Run</button>
     </div>
   </header>
   <main>
-    <textarea id="code" spellcheck="false">import turtle
+    <section class="editor-wrap">
+      <div class="label">Code</div>
+      <textarea id="code" spellcheck="false">import turtle
+import shelve
 
+datos = shelve.open("local_storage")
+nombre = datos.get("username", "")
+if not nombre:
+    nombre = input("Your name: ")
+    data["username"] = name
+data.close()
+
+print("Hello" + name + "\nÑandu ready")
+
+wn = turtle.Screen()
 t = turtle.Turtle()
-t.speed(5)
+t.color("#7B5CFF")
+t.pensize(3)
 
-for _ in range(4):
-    t.forward(100)
-    t.right(90)
+def TurnLeft():
+    t.left(20)
 
-print("square done")
+def TurnRight():
+    t.right(20)
+
+def GoForward():
+    t.forward(25)
+
+wn.onkeypress(TurnLeft, "Left")
+wn.onkeypress(TurnRight, "Right")
+wn.onkeypress(GoForward, "Up")
+wn.listen()
+print("Click the stage and use the arrows")
 </textarea>
-    <div class="right">
-      <div id="turtle"></div>
-      <pre id="output">Loading…</pre>
-    </div>
+    </section>
+    <section class="stage-wrap">
+      <div class="label">Stage</div>
+      <div class="stage-frame">
+        <div id="turtle" tabindex="0"></div>
+      </div>
+    </section>
   </main>
+  <section class="console">
+    <div class="label">Console</div>
+    <pre id="output">Loading</pre>
+    <textarea id="stdin" placeholder="When the code asks for an input(), write here and click Enter" disabled></textarea>
+  </section>
   <script>
     const inDiscord = /\.discordsays\.com$/i.test(location.hostname);
-    const cdn = inDiscord
-      ? "/cdn/npm"
-      : "https://cdn.jsdelivr.net/npm";
+    const cdn = inDiscord ? "/cdn/npm" : "https://cdn.jsdelivr.net/npm";
 
     function loadScript(src) {
       return new Promise(function (resolve, reject) {
@@ -127,6 +218,17 @@ print("square done")
         el.src = src;
         el.onload = resolve;
         el.onerror = function () { reject(new Error("Failed to load " + src)); };
+        document.head.appendChild(el);
+      });
+    }
+
+    function loadCss(href) {
+      return new Promise(function (resolve) {
+        const el = document.createElement("link");
+        el.rel = "stylesheet";
+        el.href = href;
+        el.onload = resolve;
+        el.onerror = resolve;
         document.head.appendChild(el);
       });
     }
@@ -143,10 +245,153 @@ print("square done")
       }
     }
 
+    const SHELVE_JS = [
+      "var $builtinmodule = function () {",
+      "  var mod = {};",
+      "  function toJs(v) {",
+      "    if (v === undefined || v === null) return null;",
+      "    if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return v;",
+      "    if (v.v !== undefined && (typeof v.v === 'string' || typeof v.v === 'number')) return v.v;",
+      "    if (Sk.ffi && Sk.ffi.remapToJs) {",
+      "      try { return Sk.ffi.remapToJs(v); } catch (e) {}",
+      "    }",
+      "    return String(v);",
+      "  }",
+      "  function toPy(v) {",
+      "    if (v === null || v === undefined) return Sk.builtin.none.none$;",
+      "    if (typeof v === 'string') return new Sk.builtin.str(v);",
+      "    if (typeof v === 'boolean') return v ? Sk.builtin.bool.true$ : Sk.builtin.bool.false$;",
+      "    if (typeof v === 'number') {",
+      "      if (Sk.builtin.int_ && Number.isInteger(v)) return new Sk.builtin.int_(v);",
+      "      if (Sk.builtin.float_) return new Sk.builtin.float_(v);",
+      "    }",
+      "    if (Sk.ffi && Sk.ffi.remapToPy) {",
+      "      try { return Sk.ffi.remapToPy(v); } catch (e) {}",
+      "    }",
+      "    return new Sk.builtin.str(JSON.stringify(v));",
+      "  }",
+      "  function persist(self) {",
+      "    try { localStorage.setItem('skulpt_shelve_' + self._filename, JSON.stringify(self._data)); } catch (e) {}",
+      "  }",
+      "  var shelf = function ($gbl, $loc) {",
+      "    $loc.__init__ = new Sk.builtin.func(function (self, filename) {",
+      "      self._filename = String(toJs(filename) || 'default');",
+      "      self._data = {};",
+      "      try { self._data = JSON.parse(localStorage.getItem('skulpt_shelve_' + self._filename) || '{}'); } catch (e) { self._data = {}; }",
+      "      return Sk.builtin.none.none$;",
+      "    });",
+      "    $loc.__getitem__ = new Sk.builtin.func(function (self, key) {",
+      "      var k = String(toJs(key));",
+      "      if (!Object.prototype.hasOwnProperty.call(self._data, k)) throw new Sk.builtin.KeyError(k);",
+      "      return toPy(self._data[k]);",
+      "    });",
+      "    $loc.__setitem__ = new Sk.builtin.func(function (self, key, value) {",
+      "      self._data[String(toJs(key))] = toJs(value);",
+      "      persist(self);",
+      "      return Sk.builtin.none.none$;",
+      "    });",
+      "    $loc.__delitem__ = new Sk.builtin.func(function (self, key) {",
+      "      delete self._data[String(toJs(key))];",
+      "      persist(self);",
+      "      return Sk.builtin.none.none$;",
+      "    });",
+      "    $loc.__contains__ = new Sk.builtin.func(function (self, key) {",
+      "      return Object.prototype.hasOwnProperty.call(self._data, String(toJs(key))) ? Sk.builtin.bool.true$ : Sk.builtin.bool.false$;",
+      "    });",
+      "    $loc.get = new Sk.builtin.func(function (self, key, dflt) {",
+      "      var k = String(toJs(key));",
+      "      if (Object.prototype.hasOwnProperty.call(self._data, k)) return toPy(self._data[k]);",
+      "      return dflt === undefined ? Sk.builtin.none.none$ : dflt;",
+      "    });",
+      "    $loc.keys = new Sk.builtin.func(function (self) { return toPy(Object.keys(self._data)); });",
+      "    $loc.close = new Sk.builtin.func(function (self) { persist(self); return Sk.builtin.none.none$; });",
+      "    $loc.sync = new Sk.builtin.func(function (self) { persist(self); return Sk.builtin.none.none$; });",
+      "    $loc.__len__ = new Sk.builtin.func(function (self) { return new Sk.builtin.int_(Object.keys(self._data).length); });",
+      "  };",
+      "  mod.Shelf = Sk.misceval.buildClass(mod, shelf, 'Shelf', []);",
+      "  mod.open = new Sk.builtin.func(function (filename) {",
+      "    filename = filename || new Sk.builtin.str('default');",
+      "    return Sk.misceval.callsim(mod.Shelf, filename);",
+      "  });",
+      "  return mod;",
+      "};",
+    ].join("\n");
+
+    function patchSkulptStdlib() {
+      const files = Sk.builtinFiles && Sk.builtinFiles.files;
+      if (!files) return;
+      delete files["src/lib/shelve.py"];
+      files["src/lib/shelve.js"] = SHELVE_JS;
+
+      let turtle = files["src/lib/turtle.js"];
+      if (!turtle || turtle.indexOf("$onkeypress") !== -1) return;
+
+      turtle = turtle.replace(
+        "e.$onkey.minArgs=2",
+        "e.$onkeypress=e.$onkey;e.$onkeypress.minArgs=1;e.$onkeypress.co_varnames=[\"fun\",\"key\"];e.$onkeyrelease=e.$onkey;e.$onkey.minArgs=2"
+      );
+      turtle = turtle.replace(
+        "addModuleMethod(Screen,y,\"$title\",getScreen)",
+        "addModuleMethod(Screen,y,\"$title\",getScreen),addModuleMethod(Screen,y,\"$listen\",getScreen),addModuleMethod(Screen,y,\"$onkey\",getScreen),addModuleMethod(Screen,y,\"$onkeypress\",getScreen),addModuleMethod(Screen,y,\"$onkeyrelease\",getScreen),addModuleMethod(Screen,y,\"$onscreenclick\",getScreen),addModuleMethod(Screen,y,\"$ontimer\",getScreen)"
+      );
+      turtle = turtle.replace(
+        "e.$listen=function(){this._createKeyUpListener(),this._createKeyDownListener()}",
+        "e.$listen=function(){this._createKeyUpListener(),this._createKeyDownListener();try{var c=document.getElementById(\"turtle\");if(c){c.tabIndex=0;c.focus();}var cv=c&&c.querySelector(\"canvas\");if(cv){cv.tabIndex=0;cv.focus();}}catch(x){}}"
+      );
+      turtle = turtle.replace(
+        "getTarget().addEventListener(\"keydown\",this._keyDownListener)",
+        "document.addEventListener(\"keydown\",this._keyDownListener)"
+      );
+      turtle = turtle.replace(
+        "getTarget().addEventListener(\"keyup\",this._keyUpListener)",
+        "document.addEventListener(\"keyup\",this._keyUpListener)"
+      );
+      turtle = turtle.replace(
+        "if(focusTurtle()){",
+        "var ae=document.activeElement;if(ae&&(ae.id===\"stdin\"||ae.tagName===\"TEXTAREA\"||(ae.closest&&ae.closest(\".CodeMirror\"))))return;if(true){"
+      );
+      files["src/lib/turtle.js"] = turtle;
+    }
+
     function setupEditor() {
       const output = document.getElementById("output");
-      const code = document.getElementById("code");
       const turtle = document.getElementById("turtle");
+      const stdin = document.getElementById("stdin");
+      const runBtn = document.getElementById("run");
+      const stopBtn = document.getElementById("stop");
+      let waiting = null;
+      let running = false;
+
+      const editor = CodeMirror.fromTextArea(document.getElementById("code"), {
+        mode: "python",
+        theme: "material-palenight",
+        lineNumbers: true,
+        indentUnit: 4,
+        tabSize: 4,
+        lineWrapping: true,
+        extraKeys: {
+          "Ctrl-Enter": runCode,
+          "Cmd-Enter": runCode,
+        },
+      });
+
+      function appendOut(text, isError) {
+        if (text == null) return;
+        text = String(text);
+        if (isError) output.classList.add("error");
+        output.textContent += text;
+        output.scrollTop = output.scrollHeight;
+      }
+
+      function setRunning(value) {
+        running = value;
+        runBtn.style.display = value ? "none" : "inline-block";
+        stopBtn.style.display = value ? "inline-block" : "none";
+        if (!value) {
+          stdin.disabled = true;
+          waiting = null;
+        }
+      }
 
       function builtinRead(filename) {
         if (!Sk.builtinFiles || !Sk.builtinFiles.files[filename]) {
@@ -155,47 +400,88 @@ print("square done")
         return Sk.builtinFiles.files[filename];
       }
 
+      function pythonInput(promptText) {
+        return new Promise(function (resolve) {
+          if (promptText) appendOut(String(promptText));
+          stdin.disabled = false;
+          stdin.value = "";
+          stdin.focus();
+          waiting = resolve;
+        });
+      }
+
       function runCode() {
+        if (running) return;
         output.textContent = "";
         output.classList.remove("error");
         turtle.innerHTML = "";
+        setRunning(true);
+        Sk.execLimit = Number.POSITIVE_INFINITY;
         Sk.configure({
-          output: function (text) { output.textContent += text; },
+          output: function (text) { appendOut(text); },
           read: builtinRead,
+          inputfun: pythonInput,
+          inputfunTakesPrompt: true,
+          yieldLimit: 100,
+          execLimit: Number.POSITIVE_INFINITY,
           __future__: Sk.python3,
         });
         Sk.TurtleGraphics = Sk.TurtleGraphics || {};
         Sk.TurtleGraphics.target = "turtle";
         Sk.misceval.asyncToPromise(function () {
-          return Sk.importMainWithBody("<stdin>", false, code.value, true);
+          const source = editor.getValue().replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+          return Sk.importMainWithBody("<stdin>", false, source, true);
         }).then(function () {
-          if (!output.textContent) output.textContent = "Finished.";
+          appendOut(output.textContent.endsWith("\n") || !output.textContent ? "" : "\n");
+          if (!output.textContent.trim()) appendOut("Listo.\n");
         }).catch(function (err) {
-          output.classList.add("error");
-          output.textContent = err.toString();
+          appendOut(String(err) + "\n", true);
+        }).finally(function () {
+          setRunning(false);
         });
       }
 
+      stdin.addEventListener("keydown", function (event) {
+        if (event.key !== "Enter" || event.shiftKey) return;
+        if (!waiting) return;
+        event.preventDefault();
+        const value = stdin.value.replace(/\n$/, "");
+        appendOut(value + "\n");
+        stdin.value = "";
+        stdin.disabled = true;
+        const resolve = waiting;
+        waiting = null;
+        resolve(value);
+      });
+
       document.getElementById("run").addEventListener("click", runCode);
+      document.getElementById("stop").addEventListener("click", function () {
+        Sk.execLimit = 1;
+        if (waiting) {
+          waiting("");
+          waiting = null;
+        }
+      });
       document.getElementById("clear").addEventListener("click", function () {
         output.textContent = "";
         output.classList.remove("error");
         turtle.innerHTML = "";
+        stdin.value = "";
       });
-      document.addEventListener("keydown", function (event) {
-        if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
-          event.preventDefault();
-          runCode();
-        }
-      });
-      output.textContent = "Ready. Press Run.";
+
+      output.textContent = "Ready. Click Run.\ninput() goes on the box below\n";
     }
 
     (async function boot() {
       try {
         await handshakeDiscord();
+        await loadCss(cdn + "/codemirror@5.65.16/lib/codemirror.min.css");
+        await loadCss(cdn + "/codemirror@5.65.16/theme/material-palenight.css");
+        await loadScript(cdn + "/codemirror@5.65.16/lib/codemirror.min.js");
+        await loadScript(cdn + "/codemirror@5.65.16/mode/python/python.min.js");
         await loadScript(cdn + "/skulpt@1.2.0/dist/skulpt.min.js");
         await loadScript(cdn + "/skulpt@1.2.0/dist/skulpt-stdlib.js");
+        patchSkulptStdlib();
         setupEditor();
       } catch (err) {
         const output = document.getElementById("output");
