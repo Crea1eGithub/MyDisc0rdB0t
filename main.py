@@ -46,8 +46,10 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 AI_KEY = os.getenv("AI-KEY")
 NIGHT_OWL_KEY = os.getenv("NIGHT-OWL")
 MEMORY_SUMMARY_KEY = os.getenv("MEMORY-SUMMARY")
-PYTHON_ACTIVITY_ID = os.getenv("PYTHON_ACTIVITY_ID")
+APPLICATION_ID = os.getenv("APPLICATION_ID", "1348335637656371330")
+PYTHON_ACTIVITY_ID = os.getenv("PYTHON_ACTIVITY_ID", APPLICATION_ID)
 PYTHON_ACTIVITY_URL = os.getenv("PYTHON_ACTIVITY_URL")
+OPEN_MOUTH_EMOJI = ":open_mouth:"
 
 if not TOKEN:
     raise RuntimeError(
@@ -63,6 +65,7 @@ if not AI_KEY:
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 AI_MODEL = os.getenv("AI-MODEL", "openai/gpt-oss-20b")
+SEARCH_MODEL = os.getenv("SEARCH-MODEL", "openai/gpt-oss-120b")
 SUMMARY_MODEL = os.getenv("SUMMARY-MODEL", "openai/gpt-oss-20b")
 NIGHT_OWL_PREFIX = "[night-owl=on]"
 DEEP_SEARCH_PREFIX = "[deep_search=on]"
@@ -770,28 +773,21 @@ async def generate_ai_response(
     client: OpenAI,
     use_search: bool = False,
     deep_search: bool = False,
+    is_dm: bool = False,
 ) -> tuple[str, str]:
     history_text = await build_memory_block(channel_id)
     emoji_text = format_guild_emojis(guild)
-    web_context = ""
-    if deep_search or use_search:
-        web_context = await fetch_web_context(clean_prompt, deep=deep_search)
+    use_web = deep_search or use_search
+    model = SEARCH_MODEL if use_web else AI_MODEL
+    if use_web:
         search_line = (
-            "Web snippets were fetched for you with DuckDuckGo/Wikipedia"
-            + (" and page extracts" if deep_search else "")
-            + ". Use them if relevant. Do not invent sources. "
-            "Prefer these snippets for anything from 2024 onward."
+            "You have Groq built-in browser_search. Use it for current events "
+            "and anything from 2024 onward. Do not invent sources."
         )
     else:
         search_line = (
             "You cannot browse the web in this request. Answer from what you know. "
             "If the user needs facts from 2024 onward, say you may be outdated."
-        )
-
-    user_message = clean_prompt
-    if web_context:
-        user_message = (
-            f"{clean_prompt}\n\nWeb snippets (may be incomplete):\n{web_context}"
         )
 
     system_prompt = f"""You are a Discord bot AI assistant.
@@ -812,16 +808,42 @@ Answer clearly and helpfully. You can be casual and match the user's tone when a
 Keep responses reasonably concise unless more detail is requested.
 """
 
-    start_time = asyncio.get_event_loop().time()
-    completion = await asyncio.to_thread(
-        client.chat.completions.create,
-        model=AI_MODEL,
-        messages=[
+    request = {
+        "model": model,
+        "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
+            {"role": "user", "content": clean_prompt},
         ],
-        max_tokens=MAX_ANSWER_TOKENS,
-    )
+        "max_tokens": MAX_ANSWER_TOKENS,
+    }
+    if use_web:
+        request["tools"] = [{"type": "browser_search"}]
+        request["tool_choice"] = "required"
+        request["extra_body"] = {"reasoning_effort": "low"}
+
+    start_time = asyncio.get_event_loop().time()
+    try:
+        completion = await asyncio.to_thread(
+            client.chat.completions.create,
+            **request,
+        )
+    except Exception as error:
+        print(f"Primary AI request failure ({model}): {error}")
+        if not use_web:
+            raise
+        web_context = await fetch_web_context(clean_prompt, deep=deep_search)
+        fallback_prompt = (
+            f"{clean_prompt}\n\nWeb snippets (may be incomplete):\n{web_context}"
+        )
+        completion = await asyncio.to_thread(
+            client.chat.completions.create,
+            model=AI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": fallback_prompt},
+            ],
+            max_tokens=MAX_ANSWER_TOKENS,
+        )
     answer = completion.choices[0].message.content or "No response generated."
     elapsed = asyncio.get_event_loop().time() - start_time
     thinking_seconds = max(1, round(elapsed))
@@ -832,8 +854,78 @@ Keep responses reasonably concise unless more detail is requested.
     })
     await save_memory()
 
-    thought_line = f'**"Ö" ahh bot thought for {thinking_seconds} seconds**'
+    thought_line = format_thought_line(is_dm, thinking_seconds)
     return thought_line, answer
+
+
+def format_thought_line(is_dm: bool, thinking_seconds: int) -> str:
+    if is_dm:
+        return f'**"Ö" ahh bot thought for {thinking_seconds} seconds**'
+    return f"{OPEN_MOUTH_EMOJI} lemme think for a sec"
+
+
+async def load_open_mouth_emoji() -> None:
+    global OPEN_MOUTH_EMOJI
+    try:
+        emojis = await bot.fetch_application_emojis()
+        for emoji in emojis:
+            if emoji.name.lower() == "open_mouth":
+                OPEN_MOUTH_EMOJI = str(emoji)
+                print(f"Using application emoji {OPEN_MOUTH_EMOJI}")
+                return
+    except Exception as error:
+        print(f"App emoji load failure: {error}")
+
+
+async def handle_chat_prompt(message: discord.Message, prompt: str, is_dm: bool) -> None:
+    night_owl, deep_search, clean_prompt = strip_prompt_flags(prompt)
+    if not clean_prompt:
+        await message.channel.send("Please provide a prompt.")
+        return
+
+    use_search = deep_search or needs_fresh_info(clean_prompt)
+    quota_error = check_talk_quota(message.author)
+    if quota_error:
+        await message.channel.send(quota_error)
+        return
+
+    client, error = resolve_ai_client(night_owl)
+    if error or client is None:
+        await message.channel.send(error or "The AI is unavailable.")
+        return
+
+    consume_talk_quota(message.author)
+    await save_memory()
+
+    async def send(content):
+        if is_dm:
+            await message.channel.send(content)
+        else:
+            await message.reply(content, mention_author=False)
+
+    async with message.channel.typing():
+        try:
+            thought_line, answer = await generate_ai_response(
+                channel_id=message.channel.id,
+                username=message.author.display_name,
+                guild=message.guild,
+                clean_prompt=clean_prompt,
+                client=client,
+                use_search=use_search,
+                deep_search=deep_search,
+                is_dm=is_dm,
+            )
+            await send_ai_chunks(send, clean_prompt, thought_line, answer)
+        except Exception as error:
+            print(f"AI message request failure: {error}")
+            await send("⚠️ The AI service could not process the request right now.")
+
+
+def mention_prompt(message: discord.Message) -> str | None:
+    if bot.user is None or bot.user not in message.mentions:
+        return None
+    text = re.sub(rf"<@!?{bot.user.id}>", " ", message.content or "")
+    return text.strip()
 
 
 async def send_ai_chunks(send, clean_prompt: str, thought_line: str, answer: str) -> None:
@@ -888,6 +980,11 @@ async def on_ready():
         asyncio.create_task(sync_app_commands())
 
     try:
+        await load_open_mouth_emoji()
+    except Exception as error:
+        print(f"Open mouth emoji failure: {error}")
+
+    try:
         await load_memory_from_discord()
     except Exception as error:
         print(f"Discord memory load failure: {error}")
@@ -923,52 +1020,19 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-    if message.guild is not None:
-        return
-    if not isinstance(message.channel, discord.DMChannel):
-        return
-
-    prompt = (message.content or "").strip()
-    if not prompt:
+    if isinstance(message.channel, discord.DMChannel):
+        prompt = (message.content or "").strip()
+        if prompt:
+            await handle_chat_prompt(message, prompt, is_dm=True)
         return
 
-    night_owl, deep_search, clean_prompt = strip_prompt_flags(prompt)
-    if not clean_prompt:
-        await message.channel.send("Please provide a prompt.")
+    mentioned = mention_prompt(message)
+    if mentioned is None:
         return
-
-    use_search = deep_search or needs_fresh_info(clean_prompt)
-
-    quota_error = check_talk_quota(message.author)
-    if quota_error:
-        await message.channel.send(quota_error)
+    if not mentioned:
+        await message.reply("Please provide a prompt.", mention_author=False)
         return
-
-    client, error = resolve_ai_client(night_owl)
-    if error or client is None:
-        await message.channel.send(error or "The AI is unavailable.")
-        return
-
-    consume_talk_quota(message.author)
-    await save_memory()
-
-    async with message.channel.typing():
-        try:
-            thought_line, answer = await generate_ai_response(
-                channel_id=message.channel.id,
-                username=message.author.display_name,
-                guild=None,
-                clean_prompt=clean_prompt,
-                client=client,
-                use_search=use_search,
-                deep_search=deep_search,
-            )
-            await send_ai_chunks(message.channel.send, clean_prompt, thought_line, answer)
-        except Exception as error:
-            print(f"AI DM request failure: {error}")
-            await message.channel.send(
-                "⚠️ The AI service could not process the request right now."
-            )
+    await handle_chat_prompt(message, mentioned, is_dm=False)
 
 
 @bot.tree.command(
@@ -1019,6 +1083,7 @@ async def talk(
             client=client,
             use_search=use_search,
             deep_search=deep_search,
+            is_dm=interaction.guild is None,
         )
         await send_ai_chunks(interaction.followup.send, clean_prompt, thought_line, answer)
     except Exception as error:
