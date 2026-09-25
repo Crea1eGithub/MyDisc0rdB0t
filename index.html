@@ -165,18 +165,17 @@
       <div class="label">Code</div>
       <textarea id="code" spellcheck="false">import turtle
 import shelve
-
-datos = shelve.open("local_storage")
-nombre = datos.get("username", "")
-if not nombre:
-    nombre = input("Your name: ")
+import turtle as t
+data = shelve.open("local_storage")
+name = datos.get("username", "")
+if not name:
+    name = input("Your name: ")
     data["username"] = name
 data.close()
 
-print("Hello" + name + "\nÑandu ready")
+print("Hello" + name + "\nÑ in Ñandu, and other special characters are ready")
 
-wn = turtle.Screen()
-t = turtle.Turtle()
+wn = t.Screen()
 t.color("#7B5CFF")
 t.pensize(3)
 
