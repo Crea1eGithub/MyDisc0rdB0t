@@ -1,52 +1,52 @@
 <!DOCTYPE html>
-<html lang="es">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>IDE de Python de Crea1e</title>
+    <title>Crea1e's Python IDE</title>
     <script src="https://jsdelivr.net"></script>
     <script src="https://googleapis.com"></script>
-    <!-- Asegúrate de usar la última versión de Skulpt para mayor compatibilidad -->
+    <!-- Using stable Skulpt distribution -->
     <script src="https://jsdelivr.net"></script>
     <script src="https://jsdelivr.net"></script>
 </head>
 <body class="bg-gray-900 text-white min-h-screen flex flex-col items-center p-6">
 
-    <h1 class="text-3xl font-bold mb-6">Mi IDE de Python</h1>
+    <h1 class="text-3xl font-bold mb-6">My Python IDE</h1>
 
     <div class="w-full max-w-4xl grid grid-cols-1 md:grid-cols-2 gap-6">
-        <!-- Panel Izquierdo: Editor -->
+        <!-- Left Panel: Code Editor -->
         <div class="bg-gray-800 p-4 rounded shadow">
             <h2 class="text-xl font-bold mb-2">Editor:</h2>
-            <textarea id="code" class="w-full h-64 bg-gray-950 text-yellow-300 font-mono p-3 rounded border border-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Escribe tu código Python aquí..."></textarea>
+            <textarea id="code" class="w-full h-64 bg-gray-950 text-yellow-300 font-mono p-3 rounded border border-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Write your Python code here..."></textarea>
             <button onclick="runCode()" class="mt-4 bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded transition w-full">
-                Ejecutar Código
+                Run Code
             </button>
         </div>
 
-        <!-- Panel Derecho: Consola y Ventanas de Tkinter -->
+        <!-- Right Panel: Console & Tkinter Windows -->
         <div class="bg-gray-800 p-4 rounded shadow flex flex-col justify-between">
             <div>
-                <h2 class="text-xl font-bold mb-2">Resultado:</h2>
-                <!-- Consola de Texto Estándar (Salidas de print) -->
+                <h2 class="text-xl font-bold mb-2">Output:</h2>
+                <!-- Standard Text Console (print outputs) -->
                 <pre id="output" class="text-green-400 font-mono whitespace-pre-wrap bg-gray-950 p-3 rounded border border-gray-700 min-h-[100px]"></pre>
             </div>
             
-            <!-- Contenedor Gráfico Exclusivo para Ventanas de Tkinter / Turtle -->
+            <!-- Graphic Container dedicated for Tkinter / Turtle Windows -->
             <div class="mt-4">
-                <h3 class="text-sm font-semibold text-gray-400 mb-1">Interfaz Gráfica (Tkinter):</h3>
+                <h3 class="text-sm font-semibold text-gray-400 mb-1">Graphical Interface (Tkinter):</h3>
                 <div id="tkinter-canvas" class="bg-gray-950 border border-gray-700 rounded p-2 min-h-[150px] flex items-center justify-center text-gray-600 font-mono text-sm">
-                    Las ventanas se dibujarán aquí...
+                    Windows will render here...
                 </div>
             </div>
         </div>
     </div>
 
     <script>
-        // Función encargada de resolver e interceptar las librerías internas y externas
+        // Intercepts built-in and external Python modules
         function builtinRead(x) {
             if (Sk.builtinFiles === undefined || Sk.builtinFiles["files"][x] === undefined) {
-                // Intercepta de forma dinámica la llamada cuando el usuario importa tkinter
+                // Intercept when the user types "import tkinter"
                 if (x === "src/lib/tkinter/__init__.js") {
                     return Sk.readUrl("https://githubusercontent.com");
                 }
@@ -60,30 +60,30 @@
             const outputElement = document.getElementById('output');
             const canvasElement = document.getElementById('tkinter-canvas');
             
-            // Limpiamos los paneles antes de cada ejecución
+            // Clear previous outputs before each execution
             outputElement.innerText = '';
             canvasElement.innerHTML = ''; 
 
-            // Redirección de la función print estándar a nuestro recuadro de texto
+            // Redirect standard print() statements to our text box
             function outf(text) {
                 outputElement.innerText += text;
             }
 
-            // Configuración del motor de Skulpt
+            // Skulpt engine configuration
             Sk.configure({
                 output: outf,
                 read: builtinRead,
-                // Le asignamos el contenedor HTML donde el emulador construirá la UI de Tkinter
+                // Assign the HTML container where the emulator builds the UI
                 graphicsContainer: canvasElement 
             });
 
-            // Ejecución asíncrona del código compilado por Skulpt
+            // Asynchronous code compilation and execution
             Sk.misceval.asyncToPromise(function() {
                 return Sk.importMainWithBody("<stdin>", false, code, true);
             }).then(function(mod) {
-                console.log('¡Ejecución completada con éxito!');
+                console.log('Execution completed successfully!');
             }, function(err) {
-                // Si ocurre un error de sintaxis o ejecución en Python, lo mandamos a la consola del IDE
+                // If a Python syntax/runtime error occurs, append it to the console output
                 outputElement.innerText += "\n" + err.toString();
             });
         }
