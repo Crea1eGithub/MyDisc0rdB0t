@@ -50,6 +50,7 @@ APPLICATION_ID = os.getenv("APPLICATION_ID", "1348335637656371330")
 PYTHON_ACTIVITY_ID = os.getenv("PYTHON_ACTIVITY_ID", APPLICATION_ID)
 PYTHON_ACTIVITY_URL = os.getenv("PYTHON_ACTIVITY_URL")
 OPEN_MOUTH_EMOJI = ":open_mouth:"
+SEAHORSE_EMOJI = "<:seahorse:1554464159947817091>"
 
 if not TOKEN:
     raise RuntimeError(
@@ -75,7 +76,8 @@ OLDER_SNIPPET_LIMIT = 10
 SNIPPET_CHARS = 72
 PROMPT_STORE_CHARS = 160
 EMOJI_PROMPT_LIMIT = 12
-MAX_ANSWER_TOKENS = 700
+MAX_ANSWER_TOKENS = 500
+MAX_SEARCH_TOKENS = 350
 STATUS_ROTATE_MINUTES = 8
 MEMORY_FILE = os.getenv("MEMORY_FILE", "memory.json")
 MEMORY_CHANNEL_ID = os.getenv("MEMORY_CHANNEL_ID")
@@ -659,12 +661,12 @@ def check_talk_quota(user: discord.abc.User) -> str | None:
     used = int(talk_usage["users"].get(user_key, 0))
     if used >= TALK_USER_DAILY_LIMIT:
         return (
-            f"⛔ Llegaste a tu límite de **{TALK_USER_DAILY_LIMIT}** mensajes de IA hoy. "
+            f"🚫 Llegaste a tu límite de **{TALK_USER_DAILY_LIMIT}** mensajes de IA hoy. "
             "Se reinicia a las **00:00 UTC-5**."
         )
     if int(talk_usage["global"]) >= TALK_GLOBAL_DAILY_LIMIT:
         return (
-            "⛔ El bot llegó al límite global de IA de hoy. "
+            "🚫 El bot llegó al límite global de IA de hoy. "
             "Se reinicia a las **00:00 UTC-5**."
         )
     return None
@@ -777,12 +779,21 @@ async def generate_ai_response(
 ) -> tuple[str, str]:
     history_text = await build_memory_block(channel_id)
     emoji_text = format_guild_emojis(guild)
-    use_web = deep_search or use_search
-    model = SEARCH_MODEL if use_web else AI_MODEL
-    if use_web:
+    use_lite_search = use_search and not deep_search
+    use_groq_browse = deep_search
+    model = SEARCH_MODEL if use_groq_browse else AI_MODEL
+    web_context = ""
+
+    if use_groq_browse:
         search_line = (
-            "You have Groq built-in browser_search. Use it for current events "
-            "and anything from 2024 onward. Do not invent sources."
+            "You have Groq browser_search. Use it once, briefly, only if needed. "
+            "Do not invent sources. Keep the answer short."
+        )
+    elif use_lite_search:
+        web_context = await fetch_web_context(clean_prompt, deep=False)
+        search_line = (
+            "Web snippets were fetched with Wikipedia/DuckDuckGo (not Groq browse). "
+            "Use them if relevant. Do not invent sources. Keep the answer short."
         )
     else:
         search_line = (
@@ -803,22 +814,33 @@ Recent chat history in this channel (saved on disk; only a short recap is includ
 Custom emojis available in this server (use the exact usage string in your reply if you want one to render):
 {emoji_text}
 
+Application emojis (always available, write them EXACTLY as shown):
+- seahorse: {SEAHORSE_EMOJI}
+- open_mouth: {OPEN_MOUTH_EMOJI}
+If anyone asks for a seahorse emoji, use {SEAHORSE_EMOJI}. Do not say you cannot find one.
+
 When you want a custom emoji, write it exactly like <:name:id> or <a:name:id> for animated ones.
 Answer clearly and helpfully. You can be casual and match the user's tone when appropriate.
 Keep responses reasonably concise unless more detail is requested.
 """
 
+    user_message = clean_prompt
+    if web_context:
+        user_message = (
+            f"{clean_prompt}\n\nWeb snippets (may be incomplete):\n{web_context}"
+        )
+
     request = {
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": clean_prompt},
+            {"role": "user", "content": user_message},
         ],
-        "max_tokens": MAX_ANSWER_TOKENS,
+        "max_tokens": MAX_SEARCH_TOKENS if use_groq_browse else MAX_ANSWER_TOKENS,
     }
-    if use_web:
+    if use_groq_browse:
         request["tools"] = [{"type": "browser_search"}]
-        request["tool_choice"] = "required"
+        request["tool_choice"] = "auto"
         request["extra_body"] = {"reasoning_effort": "low"}
 
     start_time = asyncio.get_event_loop().time()
@@ -829,9 +851,10 @@ Keep responses reasonably concise unless more detail is requested.
         )
     except Exception as error:
         print(f"Primary AI request failure ({model}): {error}")
-        if not use_web:
+        if not (use_lite_search or use_groq_browse):
             raise
-        web_context = await fetch_web_context(clean_prompt, deep=deep_search)
+        if not web_context:
+            web_context = await fetch_web_context(clean_prompt, deep=False)
         fallback_prompt = (
             f"{clean_prompt}\n\nWeb snippets (may be incomplete):\n{web_context}"
         )
@@ -854,25 +877,30 @@ Keep responses reasonably concise unless more detail is requested.
     })
     await save_memory()
 
-    thought_line = format_thought_line(is_dm, thinking_seconds)
+    thought_line = format_thought_line(thinking_seconds)
     return thought_line, answer
 
 
-def format_thought_line(is_dm: bool, thinking_seconds: int) -> str:
-    if is_dm:
-        return f'**"Ö" ahh bot thought for {thinking_seconds} seconds**'
+def format_thought_line(thinking_seconds: int) -> str:
+    return f'**"Ö" ahh bot thought for {thinking_seconds} seconds**'
+
+
+def thinking_status_text() -> str:
     return f"{OPEN_MOUTH_EMOJI} lemme think for a sec"
 
 
-async def load_open_mouth_emoji() -> None:
-    global OPEN_MOUTH_EMOJI
+async def load_application_emojis() -> None:
+    global OPEN_MOUTH_EMOJI, SEAHORSE_EMOJI
     try:
         emojis = await bot.fetch_application_emojis()
         for emoji in emojis:
-            if emoji.name.lower() == "open_mouth":
+            name = emoji.name.lower()
+            if name == "open_mouth":
                 OPEN_MOUTH_EMOJI = str(emoji)
                 print(f"Using application emoji {OPEN_MOUTH_EMOJI}")
-                return
+            elif name == "seahorse":
+                SEAHORSE_EMOJI = str(emoji)
+                print(f"Using application emoji {SEAHORSE_EMOJI}")
     except Exception as error:
         print(f"App emoji load failure: {error}")
 
@@ -897,11 +925,21 @@ async def handle_chat_prompt(message: discord.Message, prompt: str, is_dm: bool)
     consume_talk_quota(message.author)
     await save_memory()
 
+    thinking_msg = None
+    if not is_dm:
+        thinking_msg = await message.reply(thinking_status_text(), mention_author=False)
+
     async def send(content):
         if is_dm:
             await message.channel.send(content)
         else:
             await message.reply(content, mention_author=False)
+
+    async def edit(content):
+        if thinking_msg is not None:
+            await thinking_msg.edit(content=content)
+        else:
+            await send(content)
 
     async with message.channel.typing():
         try:
@@ -915,10 +953,20 @@ async def handle_chat_prompt(message: discord.Message, prompt: str, is_dm: bool)
                 deep_search=deep_search,
                 is_dm=is_dm,
             )
-            await send_ai_chunks(send, clean_prompt, thought_line, answer)
+            await send_ai_chunks(
+                send,
+                clean_prompt,
+                thought_line,
+                answer,
+                edit=edit if thinking_msg is not None else None,
+            )
         except Exception as error:
             print(f"AI message request failure: {error}")
-            await send("⚠️ The AI service could not process the request right now.")
+            fail = "⚠️ The AI service could not process the request right now."
+            if thinking_msg is not None:
+                await thinking_msg.edit(content=fail)
+            else:
+                await send(fail)
 
 
 def mention_prompt(message: discord.Message) -> str | None:
@@ -928,16 +976,23 @@ def mention_prompt(message: discord.Message) -> str | None:
     return text.strip()
 
 
-async def send_ai_chunks(send, clean_prompt: str, thought_line: str, answer: str) -> None:
+async def send_ai_chunks(
+    send,
+    clean_prompt: str,
+    thought_line: str,
+    answer: str,
+    edit=None,
+) -> None:
     response_text = (
         f"-# {clean_prompt}\n"
         f"{thought_line}\n"
         f"{answer}"
     )
+    first = edit or send
     if len(response_text) <= 2000:
-        await send(response_text)
+        await first(response_text)
         return
-    await send(f"-# {clean_prompt}\n{thought_line}")
+    await first(f"-# {clean_prompt}\n{thought_line}")
     for start in range(0, len(answer), 1900):
         await send(answer[start:start + 1900])
 
@@ -980,7 +1035,7 @@ async def on_ready():
         asyncio.create_task(sync_app_commands())
 
     try:
-        await load_open_mouth_emoji()
+        await load_application_emojis()
     except Exception as error:
         print(f"Open mouth emoji failure: {error}")
 
@@ -1072,7 +1127,18 @@ async def talk(
 
     consume_talk_quota(interaction.user)
     await save_memory()
-    await interaction.response.defer()
+
+    is_dm = interaction.guild is None
+    if is_dm:
+        await interaction.response.defer()
+    else:
+        await interaction.response.send_message(thinking_status_text())
+
+    async def send(content):
+        await interaction.followup.send(content)
+
+    async def edit(content):
+        await interaction.edit_original_response(content=content)
 
     try:
         thought_line, answer = await generate_ai_response(
@@ -1083,14 +1149,22 @@ async def talk(
             client=client,
             use_search=use_search,
             deep_search=deep_search,
-            is_dm=interaction.guild is None,
+            is_dm=is_dm,
         )
-        await send_ai_chunks(interaction.followup.send, clean_prompt, thought_line, answer)
+        await send_ai_chunks(
+            send,
+            clean_prompt,
+            thought_line,
+            answer,
+            edit=None if is_dm else edit,
+        )
     except Exception as error:
         print(f"AI request failure: {error}")
-        await interaction.followup.send(
-            "⚠️ The AI service could not process the request right now."
-        )
+        fail = "⚠️ The AI service could not process the request right now."
+        if is_dm:
+            await interaction.followup.send(fail)
+        else:
+            await interaction.edit_original_response(content=fail)
 
 
 @bot.tree.command(
