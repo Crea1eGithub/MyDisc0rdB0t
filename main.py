@@ -1,3 +1,5 @@
+import ipaddress
+import socket
 import os
 import re
 import html as html_lib
@@ -8,7 +10,7 @@ import traceback
 from datetime import datetime, timezone, timedelta
 from threading import Thread
 from collections import defaultdict, deque
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 from openai import OpenAI
 from io import BytesIO
@@ -152,6 +154,10 @@ def memory_payload() -> dict:
             for channel_id, data in ai_summaries.items()
         },
         "talk_usage": talk_usage,
+        "languages": {
+            str(user_id): spanish
+            for user_id, spanish in user_profiles.items()
+        },
     }
 
 
@@ -201,11 +207,17 @@ def apply_memory_payload(payload: dict, source: str) -> None:
             for key, value in users.items()
             if str(value).lstrip("-").isdigit()
         }
-        talk_usage["last"] = {
-            str(key): float(value)
-            for key, value in last.items()
-            if isinstance(value, (int, float, str))
-        }
+        cleaned_last = {}
+        for key, value in last.items():
+            try:
+                cleaned_last[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
+        talk_usage["last"] = cleaned_last
+
+    for key, spanish in (payload.get("languages") or {}).items():
+        if str(key).isdigit() and isinstance(spanish, bool):
+            user_profiles[int(key)] = spanish
 
     print(
         f"Loaded AI memory: {sum(len(v) for v in ai_history.values())} prompts "
@@ -346,6 +358,8 @@ LOCALIZATION = {
         "session_init": "Guild Session Initiation",
         "choose_empty": "Give me at least two options, separated by commas.",
         "choose_result": "🎯 I choose: **{choice}**",
+        "say_denied": "Only the bot owner or members with **Manage Messages** can use this command.",
+        "say_length": "The message must be between 1 and 2000 characters.",
     },
     True: {
         "invalid_die": "Error de ejecución: Un dado válido debe poseer al menos 2 lados.",
@@ -373,6 +387,8 @@ LOCALIZATION = {
         "session_init": "Inicio de sesión en el servidor",
         "choose_empty": "Dame al menos dos opciones, separadas por comas.",
         "choose_result": "🎯 Elijo: **{choice}**",
+        "say_denied": "Solo el dueño del bot o quien tenga **Gestionar mensajes** puede usar este comando.",
+        "say_length": "El mensaje debe tener entre 1 y 2000 caracteres.",
     },
 }
 
@@ -503,23 +519,65 @@ def strip_html_text(raw: str) -> str:
     return raw
 
 
+def url_is_safe(url: str) -> bool:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or parsed.username or parsed.password:
+        return False
+    host = (parsed.hostname or "").strip(".").lower()
+    if (
+        not host
+        or host in {"localhost", "metadata.google.internal"}
+        or host.endswith((".local", ".internal", ".localhost"))
+    ):
+        return False
+    try:
+        addresses = {info[4][0] for info in socket.getaddrinfo(host, None)}
+    except socket.gaierror:
+        return False
+    if not addresses:
+        return False
+    for address in addresses:
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            return False
+        if not ip.is_global:
+            return False
+    return True
+
+
+async def fetch_limited(
+    session: aiohttp.ClientSession,
+    url: str,
+    limit: int,
+    hops: int = 3,
+) -> tuple[int, str, bytes]:
+    if hops < 0 or not await asyncio.to_thread(url_is_safe, url):
+        raise ValueError("That URL is not allowed.")
+    async with session.get(url, allow_redirects=False) as response:
+        if response.status in (301, 302, 303, 307, 308):
+            location = response.headers.get("Location")
+            if not location or hops == 0:
+                raise ValueError(f"Could not download the file (HTTP {response.status}).")
+            return await fetch_limited(session, urljoin(url, location), limit, hops - 1)
+        content_type = (response.headers.get("Content-Type") or "").lower()
+        data = await response.content.read(limit) if response.status == 200 else b""
+        return response.status, content_type, data
+
+
 async def fetch_page_extract(session: aiohttp.ClientSession, url: str) -> str:
     url = unwrap_ddg_url(url)
-    if not url.startswith("http://") and not url.startswith("https://"):
-        return ""
     try:
-        async with session.get(url, allow_redirects=True) as response:
-            if response.status != 200:
-                return ""
-            content_type = (response.headers.get("Content-Type") or "").lower()
-            if "html" not in content_type and "text" not in content_type:
-                return ""
-            raw = await response.text(errors="ignore")
-        text = strip_html_text(raw)
-        return text[:1200]
+        status, content_type, raw = await fetch_limited(session, url, 200_000)
     except Exception as error:
         print(f"Page extract failure: {error}")
         return ""
+    if status != 200 or not raw:
+        return ""
+    if "html" not in content_type and "text" not in content_type:
+        return ""
+    text = strip_html_text(raw.decode("utf-8", errors="ignore"))
+    return text[:1200]
 
 
 async def fetch_web_context(query: str, deep: bool = False) -> str:
@@ -680,6 +738,26 @@ def consume_talk_quota(user: discord.abc.User) -> None:
     talk_usage["users"][user_key] = int(talk_usage["users"].get(user_key, 0)) + 1
     talk_usage["global"] = int(talk_usage["global"]) + 1
     talk_usage["last"][user_key] = colombia_now().timestamp()
+
+
+def refund_talk_quota(user: discord.abc.User) -> None:
+    reset_talk_usage_if_needed()
+    if is_owner(user):
+        return
+    user_key = str(user.id)
+    used = int(talk_usage["users"].get(user_key, 0))
+    if used > 0:
+        talk_usage["users"][user_key] = used - 1
+    if int(talk_usage.get("global", 0)) > 0:
+        talk_usage["global"] = int(talk_usage["global"]) - 1
+    talk_usage["last"].pop(user_key, None)
+
+
+def can_speak_as_bot(user: discord.abc.User) -> bool:
+    if is_owner(user):
+        return True
+    perms = getattr(user, "guild_permissions", None)
+    return bool(perms and (perms.manage_messages or perms.administrator))
 
 
 def make_ai_client(api_key: str) -> OpenAI:
@@ -922,9 +1000,6 @@ async def handle_chat_prompt(message: discord.Message, prompt: str, is_dm: bool)
         await message.channel.send(error or "The AI is unavailable.")
         return
 
-    consume_talk_quota(message.author)
-    await save_memory()
-
     thinking_msg = None
     if not is_dm:
         thinking_msg = await message.reply(thinking_status_text(), mention_author=False)
@@ -941,8 +1016,11 @@ async def handle_chat_prompt(message: discord.Message, prompt: str, is_dm: bool)
         else:
             await send(content)
 
+    answered = False
     async with message.channel.typing():
         try:
+            consume_talk_quota(message.author)
+            await save_memory()
             thought_line, answer = await generate_ai_response(
                 channel_id=message.channel.id,
                 username=message.author.display_name,
@@ -953,6 +1031,7 @@ async def handle_chat_prompt(message: discord.Message, prompt: str, is_dm: bool)
                 deep_search=deep_search,
                 is_dm=is_dm,
             )
+            answered = True
             await send_ai_chunks(
                 send,
                 clean_prompt,
@@ -962,6 +1041,9 @@ async def handle_chat_prompt(message: discord.Message, prompt: str, is_dm: bool)
             )
         except Exception as error:
             print(f"AI message request failure: {error}")
+            if not answered:
+                refund_talk_quota(message.author)
+                await save_memory()
             fail = "⚠️ The AI service could not process the request right now."
             if thinking_msg is not None:
                 await thinking_msg.edit(content=fail)
@@ -976,6 +1058,13 @@ def mention_prompt(message: discord.Message) -> str | None:
     return text.strip()
 
 
+def prompt_preview(clean_prompt: str, limit: int = 180) -> str:
+    preview = " ".join((clean_prompt or "").split())
+    if len(preview) > limit:
+        preview = preview[: limit - 1] + "…"
+    return preview
+
+
 async def send_ai_chunks(
     send,
     clean_prompt: str,
@@ -983,16 +1072,15 @@ async def send_ai_chunks(
     answer: str,
     edit=None,
 ) -> None:
-    response_text = (
-        f"-# {clean_prompt}\n"
-        f"{thought_line}\n"
-        f"{answer}"
-    )
+    header = f"-# {prompt_preview(clean_prompt)}\n{thought_line}"
+    if len(header) > 2000:
+        header = header[:1999] + "…"
+    response_text = f"{header}\n{answer}"
     first = edit or send
     if len(response_text) <= 2000:
         await first(response_text)
         return
-    await first(f"-# {clean_prompt}\n{thought_line}")
+    await first(header)
     for start in range(0, len(answer), 1900):
         await send(answer[start:start + 1900])
 
@@ -1125,9 +1213,6 @@ async def talk(
         await interaction.response.send_message(error or "The AI is unavailable.", ephemeral=True)
         return
 
-    consume_talk_quota(interaction.user)
-    await save_memory()
-
     is_dm = interaction.guild is None
     if is_dm:
         await interaction.response.defer()
@@ -1140,7 +1225,10 @@ async def talk(
     async def edit(content):
         await interaction.edit_original_response(content=content)
 
+    answered = False
     try:
+        consume_talk_quota(interaction.user)
+        await save_memory()
         thought_line, answer = await generate_ai_response(
             channel_id=interaction.channel.id if interaction.channel else 0,
             username=interaction.user.display_name,
@@ -1151,6 +1239,7 @@ async def talk(
             deep_search=deep_search,
             is_dm=is_dm,
         )
+        answered = True
         await send_ai_chunks(
             send,
             clean_prompt,
@@ -1160,6 +1249,9 @@ async def talk(
         )
     except Exception as error:
         print(f"AI request failure: {error}")
+        if not answered:
+            refund_talk_quota(interaction.user)
+            await save_memory()
         fail = "⚠️ The AI service could not process the request right now."
         if is_dm:
             await interaction.followup.send(fail)
@@ -1243,12 +1335,29 @@ async def switchengesp(interaction: discord.Interaction):
         get_string(user_id, "lang_updated"),
         ephemeral=True,
     )
+    await save_memory()
 
 
 @bot.tree.command(name="say", description="Echo the specified message. Use \\n for a new line.")
 @app_commands.describe(message="The message to repeat. Write \\n to insert a line break.")
 async def say(interaction: discord.Interaction, message: str):
-    await interaction.response.send_message(message.replace("\\n", "\n"))
+    user_id = interaction.user.id
+    if not can_speak_as_bot(interaction.user):
+        await interaction.response.send_message(
+            get_string(user_id, "say_denied"),
+            ephemeral=True,
+        )
+        return
+
+    text = message.replace("\\n", "\n")
+    if not text.strip() or len(text) > 2000:
+        await interaction.response.send_message(
+            get_string(user_id, "say_length"),
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(text)
 
 
 @bot.tree.command(
@@ -1386,15 +1495,15 @@ async def petpet(
             image_bytes = await image.read()
 
         elif url is not None:
-            if not url.lower().startswith(("http://", "https://")):
-                raise ValueError("The image URL must start with http:// or https://.")
-
             timeout = aiohttp.ClientTimeout(total=15)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as response:
-                    if response.status != 200:
-                        raise ValueError(f"Could not download the image (HTTP {response.status}).")
-                    image_bytes = await response.read()
+                status, content_type, image_bytes = await fetch_limited(
+                    session, url, 8_000_000
+                )
+            if status != 200 or not image_bytes:
+                raise ValueError(f"Could not download the image (HTTP {status}).")
+            if content_type and not content_type.startswith(("image/", "application/octet-stream")):
+                raise ValueError("The URL must point to an image.")
 
         else:
             target = user or interaction.user
@@ -1407,10 +1516,9 @@ async def petpet(
 
             timeout = aiohttp.ClientTimeout(total=15)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(avatar_url) as response:
-                    if response.status != 200:
-                        raise ValueError(f"Could not download the avatar (HTTP {response.status}).")
-                    image_bytes = await response.read()
+                status, _, image_bytes = await fetch_limited(session, avatar_url, 8_000_000)
+            if status != 200 or not image_bytes:
+                raise ValueError(f"Could not download the avatar (HTTP {status}).")
 
         avatar = Image.open(BytesIO(image_bytes)).convert("RGBA")
 
@@ -1422,10 +1530,10 @@ async def petpet(
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async def fetch_frame(frame_url: str) -> bytes:
-                async with session.get(frame_url) as response:
-                    if response.status != 200:
-                        raise ValueError(f"Could not download PetPet frame (HTTP {response.status}).")
-                    return await response.read()
+                status, _, data = await fetch_limited(session, frame_url, 2_000_000)
+                if status != 200 or not data:
+                    raise ValueError(f"Could not download PetPet frame (HTTP {status}).")
+                return data
 
             frame_bytes = await asyncio.gather(
                 *(fetch_frame(frame_url) for frame_url in frame_urls)
@@ -1656,6 +1764,14 @@ async def userinfo(
 ):
     user_id = interaction.user.id
     target_user = user or interaction.user
+    member = target_user if isinstance(target_user, discord.Member) else None
+    if member is None and interaction.guild is not None:
+        member = interaction.guild.get_member(target_user.id)
+        if member is None:
+            try:
+                member = await interaction.guild.fetch_member(target_user.id)
+            except (discord.NotFound, discord.HTTPException):
+                member = None
 
     embed = discord.Embed(
         title=get_string(user_id, "user_analysis").format(
@@ -1674,13 +1790,14 @@ async def userinfo(
         value=target_user.created_at.strftime("%Y-%m-%d"),
         inline=True,
     )
+    joined = (
+        member.joined_at.strftime("%Y-%m-%d")
+        if member is not None and member.joined_at
+        else "N/A"
+    )
     embed.add_field(
         name=get_string(user_id, "session_init"),
-        value=(
-            target_user.joined_at.strftime("%Y-%m-%d")
-            if isinstance(target_user, discord.Member) and target_user.joined_at
-            else "N/A"
-        ),
+        value=joined,
         inline=True,
     )
     embed.set_thumbnail(url=target_user.display_avatar.url)
