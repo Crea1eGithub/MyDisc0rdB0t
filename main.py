@@ -6,6 +6,8 @@ import html as html_lib
 import json
 import random
 import asyncio
+import hashlib
+import time
 import traceback
 from datetime import datetime, timezone, timedelta
 from threading import Thread
@@ -17,6 +19,8 @@ from io import BytesIO
 
 import aiohttp
 from PIL import Image
+
+Image.MAX_IMAGE_PIXELS = 20_000_000
 
 import discord
 from discord import app_commands
@@ -105,6 +109,8 @@ def env_int(name: str, default: int) -> int:
 TALK_USER_DAILY_LIMIT = env_int("TALK_USER_DAILY_LIMIT", 12)
 TALK_GLOBAL_DAILY_LIMIT = env_int("TALK_GLOBAL_DAILY_LIMIT", 200)
 TALK_COOLDOWN_SECONDS = env_int("TALK_COOLDOWN_SECONDS", 15)
+SYNC_COMMANDS = os.getenv("SYNC_COMMANDS", "auto").strip().lower()
+DISCORD_MEMORY_INTERVAL = max(30, env_int("DISCORD_MEMORY_INTERVAL", 120))
 
 ai_client = OpenAI(
     api_key=AI_KEY,
@@ -117,6 +123,12 @@ intents.message_content = True
 bot = commands.Bot(
     command_prefix="!",
     intents=intents,
+    allowed_mentions=discord.AllowedMentions(
+        everyone=False,
+        roles=False,
+        users=True,
+        replied_user=False,
+    ),
     allowed_contexts=app_commands.AppCommandContext(
         guild=True,
         dm_channel=True,
@@ -134,6 +146,8 @@ talk_usage: dict = {
     "last": {},
 }
 _memory_lock: asyncio.Lock | None = None
+_memory_dirty = False
+command_sync_fingerprint_saved = ""
 
 
 def get_memory_lock() -> asyncio.Lock:
@@ -158,10 +172,12 @@ def memory_payload() -> dict:
             str(user_id): spanish
             for user_id, spanish in user_profiles.items()
         },
+        "command_fingerprint": command_sync_fingerprint_saved,
     }
 
 
 def apply_memory_payload(payload: dict, source: str) -> None:
+    global command_sync_fingerprint_saved
     if not isinstance(payload, dict):
         return
 
@@ -218,6 +234,12 @@ def apply_memory_payload(payload: dict, source: str) -> None:
     for key, spanish in (payload.get("languages") or {}).items():
         if str(key).isdigit() and isinstance(spanish, bool):
             user_profiles[int(key)] = spanish
+
+    saved_fingerprint = payload.get("command_fingerprint")
+    if isinstance(saved_fingerprint, str):
+        command_sync_fingerprint_saved = saved_fingerprint
+    elif str(source).startswith("discord:"):
+        command_sync_fingerprint_saved = ""
 
     print(
         f"Loaded AI memory: {sum(len(v) for v in ai_history.values())} prompts "
@@ -286,33 +308,54 @@ async def save_memory_to_discord() -> None:
     channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
     payload = json.dumps(memory_payload(), ensure_ascii=False).encode("utf-8")
     upload = discord.File(BytesIO(payload), filename="memory.json")
-    await channel.send(
+    sent = await channel.send(
         content="AI memory snapshot (do not delete this channel).",
         file=upload,
     )
-    old_messages = []
     async for message in channel.history(limit=30):
-        if message.author.id != bot.user.id:
+        if message.id == sent.id or message.author.id != bot.user.id:
             continue
-        if any(item.filename == "memory.json" for item in message.attachments):
-            old_messages.append(message)
-    for message in old_messages[1:]:
+        if not any(item.filename == "memory.json" for item in message.attachments):
+            continue
         try:
             await message.delete()
         except Exception:
             break
 
 
-async def save_memory() -> None:
+async def save_memory(*, force_discord: bool = False) -> None:
+    global _memory_dirty
     async with get_memory_lock():
         try:
             await asyncio.to_thread(dump_memory)
         except Exception as error:
             print(f"Memory save failure: {error}")
-        try:
-            await save_memory_to_discord()
-        except Exception as error:
-            print(f"Discord memory save failure: {error}")
+        _memory_dirty = True
+        if force_discord:
+            await _upload_discord_memory_locked()
+
+
+async def _upload_discord_memory_locked() -> None:
+    global _memory_dirty
+    try:
+        await save_memory_to_discord()
+        _memory_dirty = False
+    except Exception as error:
+        print(f"Discord memory save failure: {error}")
+
+
+@tasks.loop(seconds=DISCORD_MEMORY_INTERVAL)
+async def flush_discord_memory() -> None:
+    if not _memory_dirty or memory_channel_id() is None:
+        return
+    async with get_memory_lock():
+        if _memory_dirty:
+            await _upload_discord_memory_locked()
+
+
+@flush_discord_memory.before_loop
+async def before_flush_discord_memory() -> None:
+    await bot.wait_until_ready()
 
 
 load_memory()
@@ -360,6 +403,10 @@ LOCALIZATION = {
         "choose_result": "🎯 I choose: **{choice}**",
         "say_denied": "Only the bot owner or members with **Manage Messages** can use this command.",
         "say_length": "The message must be between 1 and 2000 characters.",
+        "talk_cooldown": "⏳ Wait **{wait}s** before using the AI again.",
+        "talk_user_limit": "🚫 You reached today's limit of **{limit}** AI messages. It resets at **00:00 UTC-5**.",
+        "talk_global_limit": "🚫 The bot reached today's global AI limit. It resets at **00:00 UTC-5**.",
+        "purge_channel": "This command only works in a text channel or thread.",
     },
     True: {
         "invalid_die": "Error de ejecución: Un dado válido debe poseer al menos 2 lados.",
@@ -389,6 +436,10 @@ LOCALIZATION = {
         "choose_result": "🎯 Elijo: **{choice}**",
         "say_denied": "Solo el dueño del bot o quien tenga **Gestionar mensajes** puede usar este comando.",
         "say_length": "El mensaje debe tener entre 1 y 2000 caracteres.",
+        "talk_cooldown": "⏳ Espera **{wait}s** antes de volver a usar la IA.",
+        "talk_user_limit": "🚫 Llegaste a tu límite de **{limit}** mensajes de IA hoy. Se reinicia a las **00:00 UTC-5**.",
+        "talk_global_limit": "🚫 El bot llegó al límite global de IA de hoy. Se reinicia a las **00:00 UTC-5**.",
+        "purge_channel": "Este comando solo funciona en un canal de texto o un hilo.",
     },
 }
 
@@ -483,7 +534,7 @@ _search_cache: dict[str, tuple[float, str]] = {}
 
 
 def cache_search(query: str, snippets: str) -> None:
-    _search_cache[query.lower()[:200]] = (asyncio.get_event_loop().time(), snippets)
+    _search_cache[query.lower()[:200]] = (time.monotonic(), snippets)
     if len(_search_cache) > 40:
         oldest = min(_search_cache, key=lambda key: _search_cache[key][0])
         _search_cache.pop(oldest, None)
@@ -494,7 +545,7 @@ def cached_search(query: str) -> str | None:
     if not item:
         return None
     stored_at, snippets = item
-    if asyncio.get_event_loop().time() - stored_at > 900:
+    if time.monotonic() - stored_at > 900:
         return None
     return snippets
 
@@ -715,18 +766,12 @@ def check_talk_quota(user: discord.abc.User) -> str | None:
             elapsed = TALK_COOLDOWN_SECONDS
         if elapsed < TALK_COOLDOWN_SECONDS:
             wait = max(1, int(TALK_COOLDOWN_SECONDS - elapsed))
-            return f"⏳ Espera **{wait}s** antes de volver a usar la IA."
+            return get_string(user.id, "talk_cooldown").format(wait=wait)
     used = int(talk_usage["users"].get(user_key, 0))
     if used >= TALK_USER_DAILY_LIMIT:
-        return (
-            f"🚫 Llegaste a tu límite de **{TALK_USER_DAILY_LIMIT}** mensajes de IA hoy. "
-            "Se reinicia a las **00:00 UTC-5**."
-        )
+        return get_string(user.id, "talk_user_limit").format(limit=TALK_USER_DAILY_LIMIT)
     if int(talk_usage["global"]) >= TALK_GLOBAL_DAILY_LIMIT:
-        return (
-            "🚫 El bot llegó al límite global de IA de hoy. "
-            "Se reinicia a las **00:00 UTC-5**."
-        )
+        return get_string(user.id, "talk_global_limit")
     return None
 
 
@@ -921,7 +966,7 @@ Keep responses reasonably concise unless more detail is requested.
         request["tool_choice"] = "auto"
         request["extra_body"] = {"reasoning_effort": "low"}
 
-    start_time = asyncio.get_event_loop().time()
+    start_time = time.monotonic()
     try:
         completion = await asyncio.to_thread(
             client.chat.completions.create,
@@ -946,7 +991,7 @@ Keep responses reasonably concise unless more detail is requested.
             max_tokens=MAX_ANSWER_TOKENS,
         )
     answer = completion.choices[0].message.content or "No response generated."
-    elapsed = asyncio.get_event_loop().time() - start_time
+    elapsed = time.monotonic() - start_time
     thinking_seconds = max(1, round(elapsed))
 
     ai_history[channel_id].append({
@@ -1096,13 +1141,46 @@ async def before_rotate_status():
 
 
 async def sync_app_commands() -> None:
+    global command_sync_fingerprint_saved
+    try:
+        fingerprint = command_tree_fingerprint()
+    except Exception as error:
+        print(f"Command fingerprint failure: {error}")
+        fingerprint = ""
+
+    mode = SYNC_COMMANDS if SYNC_COMMANDS in {"auto", "always", "never"} else "auto"
+    if mode == "never":
+        print("Skipping slash command sync (SYNC_COMMANDS=never).")
+        return
+    if mode == "auto" and fingerprint and fingerprint == command_sync_fingerprint_saved:
+        print("Slash commands unchanged. Skipping Discord sync.")
+        return
+
     try:
         synced = await asyncio.wait_for(bot.tree.sync(), timeout=20)
         print(f"Successfully synchronized {len(synced)} application command(s).")
+        if fingerprint:
+            command_sync_fingerprint_saved = fingerprint
+            await save_memory(force_discord=True)
     except asyncio.TimeoutError:
         print("Command sync timed out. Using the last successful Discord command list.")
     except Exception as error:
         print(f"Synchronization failure: {error}")
+
+
+def command_tree_fingerprint() -> str:
+    chunks: list[str] = []
+    for command in bot.tree.walk_commands():
+        params = []
+        for param in getattr(command, "parameters", []) or []:
+            kind = getattr(param, "type", "")
+            kind_name = getattr(kind, "name", str(kind))
+            required = int(bool(getattr(param, "required", False)))
+            params.append(f"{param.name}:{required}:{kind_name}")
+        params.sort()
+        chunks.append(f"{command.qualified_name}|{command.description}|{','.join(params)}")
+    chunks.sort()
+    return hashlib.sha256("\n".join(chunks).encode()).hexdigest()[:20]
 
 
 @bot.event
@@ -1118,10 +1196,6 @@ async def on_ready():
     if not rotate_status.is_running():
         rotate_status.start()
 
-    if not getattr(bot, "_command_sync_started", False):
-        bot._command_sync_started = True
-        asyncio.create_task(sync_app_commands())
-
     try:
         await load_application_emojis()
     except Exception as error:
@@ -1131,6 +1205,13 @@ async def on_ready():
         await load_memory_from_discord()
     except Exception as error:
         print(f"Discord memory load failure: {error}")
+
+    if not flush_discord_memory.is_running():
+        flush_discord_memory.start()
+
+    if not getattr(bot, "_command_sync_started", False):
+        bot._command_sync_started = True
+        asyncio.create_task(sync_app_commands())
 
 
 @bot.event
@@ -1654,6 +1735,14 @@ async def purge(interaction: discord.Interaction, limit: int):
         )
         return
 
+    channel = interaction.channel
+    if channel is None or not hasattr(channel, "purge"):
+        await interaction.response.send_message(
+            get_string(user_id, "purge_channel"),
+            ephemeral=True,
+        )
+        return
+
     if not 1 <= limit <= 100:
         await interaction.response.send_message(
             get_string(user_id, "purge_limit"),
@@ -1664,7 +1753,7 @@ async def purge(interaction: discord.Interaction, limit: int):
     await interaction.response.defer(ephemeral=True)
 
     try:
-        deleted = await interaction.channel.purge(limit=limit)
+        deleted = await channel.purge(limit=limit)
         response = get_string(user_id, "purge_success").format(
             count=len(deleted)
         )
