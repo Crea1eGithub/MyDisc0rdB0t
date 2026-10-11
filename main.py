@@ -81,6 +81,7 @@ RECENT_PROMPT_LIMIT = 8
 OLDER_SNIPPET_LIMIT = 10
 SNIPPET_CHARS = 72
 PROMPT_STORE_CHARS = 160
+REPLY_STORE_CHARS = 140
 EMOJI_PROMPT_LIMIT = 12
 MAX_ANSWER_TOKENS = 500
 MAX_SEARCH_TOKENS = 350
@@ -147,7 +148,9 @@ talk_usage: dict = {
 }
 _memory_lock: asyncio.Lock | None = None
 _memory_dirty = False
+_discord_memory_loaded = False
 command_sync_fingerprint_saved = ""
+memory_saved_at = 0.0
 
 
 def get_memory_lock() -> asyncio.Lock:
@@ -159,6 +162,7 @@ def get_memory_lock() -> asyncio.Lock:
 
 def memory_payload() -> dict:
     return {
+        "saved_at": memory_saved_at,
         "history": {
             str(channel_id): list(entries)
             for channel_id, entries in ai_history.items()
@@ -177,7 +181,7 @@ def memory_payload() -> dict:
 
 
 def apply_memory_payload(payload: dict, source: str) -> None:
-    global command_sync_fingerprint_saved
+    global command_sync_fingerprint_saved, memory_saved_at
     if not isinstance(payload, dict):
         return
 
@@ -194,8 +198,12 @@ def apply_memory_payload(payload: dict, source: str) -> None:
                 continue
             user = str(item.get("user", "unknown"))
             prompt = str(item.get("prompt", ""))[:PROMPT_STORE_CHARS]
+            reply = " ".join(str(item.get("reply", "")).split())[:REPLY_STORE_CHARS]
             if prompt:
-                cleaned.append({"user": user, "prompt": prompt})
+                entry = {"user": user, "prompt": prompt}
+                if reply:
+                    entry["reply"] = reply
+                cleaned.append(entry)
         ai_history[channel_id] = deque(cleaned, maxlen=HISTORY_LIMIT)
 
     for key, summary in (payload.get("summaries") or {}).items():
@@ -241,6 +249,11 @@ def apply_memory_payload(payload: dict, source: str) -> None:
     elif str(source).startswith("discord:"):
         command_sync_fingerprint_saved = ""
 
+    try:
+        memory_saved_at = float(payload.get("saved_at") or 0)
+    except (TypeError, ValueError):
+        memory_saved_at = 0.0
+
     print(
         f"Loaded AI memory: {sum(len(v) for v in ai_history.values())} prompts "
         f"across {len(ai_history)} chats from {source}"
@@ -260,6 +273,8 @@ def load_memory() -> None:
 
 
 def dump_memory() -> None:
+    global memory_saved_at
+    memory_saved_at = time.time()
     payload = memory_payload()
     directory = os.path.dirname(os.path.abspath(MEMORY_FILE))
     if directory:
@@ -284,6 +299,9 @@ async def load_memory_from_discord() -> None:
     channel_id = memory_channel_id()
     if channel_id is None:
         return
+    if _memory_dirty:
+        print("Skipping Discord memory load; newer changes are still in memory.")
+        return
     channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
     async for message in channel.history(limit=30):
         if message.author.id != bot.user.id:
@@ -296,6 +314,15 @@ async def load_memory_from_discord() -> None:
             continue
         raw = await attachment.read()
         payload = json.loads(raw.decode("utf-8"))
+        remote_saved = 0.0
+        if isinstance(payload, dict):
+            try:
+                remote_saved = float(payload.get("saved_at") or 0)
+            except (TypeError, ValueError):
+                remote_saved = 0.0
+        if memory_saved_at and remote_saved and remote_saved + 1 < memory_saved_at:
+            print("Discord memory snapshot is older than the local file. Keeping local memory.")
+            return
         apply_memory_payload(payload, f"discord:{channel_id}")
         return
     print("No Discord memory.json found yet. It will be created on the next /talk.")
@@ -817,7 +844,13 @@ def format_history_lines(entries: list[dict], limit_chars: int | None = None) ->
         prompt = item["prompt"].replace("\n", " ")
         if limit_chars is not None:
             prompt = prompt[:limit_chars]
-        lines.append(f"- {item['user']}: {prompt}")
+        line = f"- {item['user']}: {prompt}"
+        reply = str(item.get("reply") or "").replace("\n", " ").strip()
+        if reply:
+            if limit_chars is not None:
+                reply = reply[:limit_chars]
+            line += f" -> bot: {reply}"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -931,7 +964,7 @@ The user who just talked to you is: {username}
 
 {search_line}
 
-Recent chat history in this channel (saved on disk; only a short recap is included here):
+Recent chat history in this channel (saved on disk; short user prompts and bot replies):
 {history_text}
 
 Custom emojis available in this server (use the exact usage string in your reply if you want one to render):
@@ -993,10 +1026,12 @@ Keep responses reasonably concise unless more detail is requested.
     answer = completion.choices[0].message.content or "No response generated."
     elapsed = time.monotonic() - start_time
     thinking_seconds = max(1, round(elapsed))
+    reply_snippet = " ".join(answer.split())[:REPLY_STORE_CHARS]
 
     ai_history[channel_id].append({
         "user": username,
         "prompt": clean_prompt[:PROMPT_STORE_CHARS],
+        "reply": reply_snippet,
     })
     await save_memory()
 
@@ -1185,6 +1220,7 @@ def command_tree_fingerprint() -> str:
 
 @bot.event
 async def on_ready():
+    global _discord_memory_loaded
     print(f"Logged in successfully as {bot.user} (ID: {bot.user.id})")
     print(f"Using AI model: {AI_MODEL}")
 
@@ -1201,10 +1237,14 @@ async def on_ready():
     except Exception as error:
         print(f"Open mouth emoji failure: {error}")
 
-    try:
-        await load_memory_from_discord()
-    except Exception as error:
-        print(f"Discord memory load failure: {error}")
+    if not _discord_memory_loaded:
+        try:
+            await load_memory_from_discord()
+            _discord_memory_loaded = True
+        except Exception as error:
+            print(f"Discord memory load failure: {error}")
+    else:
+        print("Skipping Discord memory reload after reconnect.")
 
     if not flush_discord_memory.is_running():
         flush_discord_memory.start()
@@ -1892,6 +1932,21 @@ async def userinfo(
     embed.set_thumbnail(url=target_user.display_avatar.url)
 
     await interaction.response.send_message(embed=embed)
+
+
+_original_close = bot.close
+
+
+async def close() -> None:
+    print("Shutting down. Flushing AI memory...")
+    try:
+        await asyncio.wait_for(save_memory(force_discord=True), timeout=20)
+    except Exception as error:
+        print(f"Shutdown memory flush failure: {error}")
+    await _original_close()
+
+
+bot.close = close
 
 
 if __name__ == "__main__":
