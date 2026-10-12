@@ -137,6 +137,9 @@ bot = commands.Bot(
     ),
 )
 
+# Repeating a user's text must not ping anyone.
+NO_USER_PINGS = discord.AllowedMentions.none()
+
 user_profiles: dict[int, bool] = {}
 ai_history: dict[int, deque] = defaultdict(lambda: deque(maxlen=HISTORY_LIMIT))
 ai_summaries: dict[int, dict] = {}
@@ -147,6 +150,7 @@ talk_usage: dict = {
     "last": {},
 }
 _memory_lock: asyncio.Lock | None = None
+_quota_lock: asyncio.Lock | None = None
 _memory_dirty = False
 _discord_memory_loaded = False
 command_sync_fingerprint_saved = ""
@@ -158,6 +162,13 @@ def get_memory_lock() -> asyncio.Lock:
     if _memory_lock is None:
         _memory_lock = asyncio.Lock()
     return _memory_lock
+
+
+def get_quota_lock() -> asyncio.Lock:
+    global _quota_lock
+    if _quota_lock is None:
+        _quota_lock = asyncio.Lock()
+    return _quota_lock
 
 
 def memory_payload() -> dict:
@@ -320,7 +331,7 @@ async def load_memory_from_discord() -> None:
                 remote_saved = float(payload.get("saved_at") or 0)
             except (TypeError, ValueError):
                 remote_saved = 0.0
-        if memory_saved_at and remote_saved and remote_saved + 1 < memory_saved_at:
+        if memory_saved_at and remote_saved + 1 < memory_saved_at:
             print("Discord memory snapshot is older than the local file. Keeping local memory.")
             return
         apply_memory_payload(payload, f"discord:{channel_id}")
@@ -825,6 +836,26 @@ def refund_talk_quota(user: discord.abc.User) -> None:
     talk_usage["last"].pop(user_key, None)
 
 
+async def take_talk_turn(user: discord.abc.User) -> str | None:
+    async with get_quota_lock():
+        error = check_talk_quota(user)
+        if error:
+            return error
+        consume_talk_quota(user)
+        return None
+
+
+async def release_talk_turn(user: discord.abc.User) -> None:
+    async with get_quota_lock():
+        refund_talk_quota(user)
+
+
+def fit_discord_message(text: str, limit: int = 2000) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
 def can_speak_as_bot(user: discord.abc.User) -> bool:
     if is_owner(user):
         return True
@@ -932,6 +963,7 @@ async def generate_ai_response(
     use_search: bool = False,
     deep_search: bool = False,
     is_dm: bool = False,
+    prefers_spanish: bool = False,
 ) -> tuple[str, str]:
     history_text = await build_memory_block(channel_id)
     emoji_text = format_guild_emojis(guild)
@@ -957,10 +989,16 @@ async def generate_ai_response(
             "If the user needs facts from 2024 onward, say you may be outdated."
         )
 
+    if prefers_spanish:
+        language_line = "The user turned on Spanish mode. Reply in Spanish unless they explicitly ask for another language."
+    else:
+        language_line = "Reply in the same language the user wrote in."
+
     system_prompt = f"""You are a Discord bot AI assistant.
 Your source code is publicly available at: https://github.com/Crea1eGithub/MyDisc0rdB0t
 
 The user who just talked to you is: {username}
+{language_line}
 
 {search_line}
 
@@ -1070,36 +1108,44 @@ async def handle_chat_prompt(message: discord.Message, prompt: str, is_dm: bool)
         return
 
     use_search = deep_search or needs_fresh_info(clean_prompt)
-    quota_error = check_talk_quota(message.author)
-    if quota_error:
-        await message.channel.send(quota_error)
-        return
 
     client, error = resolve_ai_client(night_owl)
     if error or client is None:
         await message.channel.send(error or "The AI is unavailable.")
         return
 
+    quota_error = await take_talk_turn(message.author)
+    if quota_error:
+        await message.channel.send(quota_error)
+        return
+
     thinking_msg = None
-    if not is_dm:
-        thinking_msg = await message.reply(thinking_status_text(), mention_author=False)
-
-    async def send(content):
-        if is_dm:
-            await message.channel.send(content)
-        else:
-            await message.reply(content, mention_author=False)
-
-    async def edit(content):
-        if thinking_msg is not None:
-            await thinking_msg.edit(content=content)
-        else:
-            await send(content)
-
     answered = False
-    async with message.channel.typing():
-        try:
-            consume_talk_quota(message.author)
+    try:
+        if not is_dm:
+            thinking_msg = await message.reply(
+                thinking_status_text(),
+                mention_author=False,
+                allowed_mentions=NO_USER_PINGS,
+            )
+
+        async def send(content):
+            if is_dm:
+                await message.channel.send(content, allowed_mentions=NO_USER_PINGS)
+            else:
+                await message.reply(
+                    content,
+                    mention_author=False,
+                    allowed_mentions=NO_USER_PINGS,
+                )
+
+        async def edit(content):
+            if thinking_msg is not None:
+                await thinking_msg.edit(content=content, allowed_mentions=NO_USER_PINGS)
+            else:
+                await send(content)
+
+        async with message.channel.typing():
             await save_memory()
             thought_line, answer = await generate_ai_response(
                 channel_id=message.channel.id,
@@ -1110,8 +1156,8 @@ async def handle_chat_prompt(message: discord.Message, prompt: str, is_dm: bool)
                 use_search=use_search,
                 deep_search=deep_search,
                 is_dm=is_dm,
+                prefers_spanish=user_profiles.get(message.author.id, False),
             )
-            answered = True
             await send_ai_chunks(
                 send,
                 clean_prompt,
@@ -1119,16 +1165,20 @@ async def handle_chat_prompt(message: discord.Message, prompt: str, is_dm: bool)
                 answer,
                 edit=edit if thinking_msg is not None else None,
             )
-        except Exception as error:
-            print(f"AI message request failure: {error}")
-            if not answered:
-                refund_talk_quota(message.author)
-                await save_memory()
-            fail = "⚠️ The AI service could not process the request right now."
+            answered = True
+    except Exception as error:
+        print(f"AI message request failure: {error}")
+        if not answered:
+            await release_talk_turn(message.author)
+            await save_memory()
+        fail = "⚠️ The AI service could not process the request right now."
+        try:
             if thinking_msg is not None:
-                await thinking_msg.edit(content=fail)
+                await thinking_msg.edit(content=fail, allowed_mentions=NO_USER_PINGS)
             else:
-                await send(fail)
+                await message.channel.send(fail, allowed_mentions=NO_USER_PINGS)
+        except Exception:
+            print("Could not report the AI failure to Discord.")
 
 
 def mention_prompt(message: discord.Message) -> str | None:
@@ -1324,31 +1374,33 @@ async def talk(
 
     use_search = deep_search or needs_fresh_info(clean_prompt)
 
-    quota_error = check_talk_quota(interaction.user)
-    if quota_error:
-        await interaction.response.send_message(quota_error, ephemeral=True)
-        return
-
     client, error = resolve_ai_client(night_owl)
     if error or client is None:
         await interaction.response.send_message(error or "The AI is unavailable.", ephemeral=True)
         return
 
+    quota_error = await take_talk_turn(interaction.user)
+    if quota_error:
+        await interaction.response.send_message(quota_error, ephemeral=True)
+        return
+
     is_dm = interaction.guild is None
-    if is_dm:
-        await interaction.response.defer()
-    else:
-        await interaction.response.send_message(thinking_status_text())
-
-    async def send(content):
-        await interaction.followup.send(content)
-
-    async def edit(content):
-        await interaction.edit_original_response(content=content)
-
     answered = False
     try:
-        consume_talk_quota(interaction.user)
+        if is_dm:
+            await interaction.response.defer()
+        else:
+            await interaction.response.send_message(thinking_status_text())
+
+        async def send(content):
+            await interaction.followup.send(content, allowed_mentions=NO_USER_PINGS)
+
+        async def edit(content):
+            await interaction.edit_original_response(
+                content=content,
+                allowed_mentions=NO_USER_PINGS,
+            )
+
         await save_memory()
         thought_line, answer = await generate_ai_response(
             channel_id=interaction.channel.id if interaction.channel else 0,
@@ -1359,8 +1411,8 @@ async def talk(
             use_search=use_search,
             deep_search=deep_search,
             is_dm=is_dm,
+            prefers_spanish=user_profiles.get(interaction.user.id, False),
         )
-        answered = True
         await send_ai_chunks(
             send,
             clean_prompt,
@@ -1368,16 +1420,22 @@ async def talk(
             answer,
             edit=None if is_dm else edit,
         )
+        answered = True
     except Exception as error:
         print(f"AI request failure: {error}")
         if not answered:
-            refund_talk_quota(interaction.user)
+            await release_talk_turn(interaction.user)
             await save_memory()
         fail = "⚠️ The AI service could not process the request right now."
-        if is_dm:
-            await interaction.followup.send(fail)
-        else:
-            await interaction.edit_original_response(content=fail)
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(fail, ephemeral=True)
+            elif is_dm:
+                await interaction.followup.send(fail)
+            else:
+                await interaction.edit_original_response(content=fail)
+        except Exception:
+            print("Could not report the AI failure to Discord.")
 
 
 @bot.tree.command(
@@ -1499,7 +1557,8 @@ async def choose(interaction: discord.Interaction, options: str):
 
     choice = random.choice(choices)
     await interaction.response.send_message(
-        get_string(user_id, "choose_result").format(choice=choice)
+        fit_discord_message(get_string(user_id, "choose_result").format(choice=choice)),
+        allowed_mentions=NO_USER_PINGS,
     )
 
 
@@ -1877,8 +1936,11 @@ async def eightball(interaction: discord.Interaction, question: str):
     ball_title = get_string(user_id, "ball_title")
 
     await interaction.response.send_message(
-        f"❓ **{query_label}:** {question}\n"
-        f"{ball_title} {outcome}"
+        fit_discord_message(
+            f"❓ **{query_label}:** {question}\n"
+            f"{ball_title} {outcome}"
+        ),
+        allowed_mentions=NO_USER_PINGS,
     )
 
 
