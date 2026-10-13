@@ -1,4 +1,5 @@
 import ipaddress
+import signal
 import socket
 import os
 import re
@@ -172,23 +173,49 @@ def get_quota_lock() -> asyncio.Lock:
 
 
 def memory_payload() -> dict:
+    usage = talk_usage if isinstance(talk_usage, dict) else {}
     return {
         "saved_at": memory_saved_at,
         "history": {
-            str(channel_id): list(entries)
+            str(channel_id): [dict(entry) for entry in entries]
             for channel_id, entries in ai_history.items()
         },
         "summaries": {
-            str(channel_id): data
+            str(channel_id): {
+                "fingerprint": str(data.get("fingerprint", "")),
+                "summary": str(data.get("summary", "")),
+            }
             for channel_id, data in ai_summaries.items()
+            if isinstance(data, dict)
         },
-        "talk_usage": talk_usage,
+        "talk_usage": {
+            "day": str(usage.get("day", "")),
+            "global": int(usage.get("global", 0) or 0),
+            "users": {
+                str(key): int(value)
+                for key, value in dict(usage.get("users") or {}).items()
+                if str(value).lstrip("-").isdigit()
+            },
+            "last": {
+                str(key): float(value)
+                for key, value in dict(usage.get("last") or {}).items()
+                if _is_float(value)
+            },
+        },
         "languages": {
             str(user_id): spanish
             for user_id, spanish in user_profiles.items()
         },
         "command_fingerprint": command_sync_fingerprint_saved,
     }
+
+
+def _is_float(value) -> bool:
+    try:
+        float(value)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def apply_memory_payload(payload: dict, source: str) -> None:
@@ -283,10 +310,7 @@ def load_memory() -> None:
     apply_memory_payload(payload, MEMORY_FILE)
 
 
-def dump_memory() -> None:
-    global memory_saved_at
-    memory_saved_at = time.time()
-    payload = memory_payload()
+def dump_memory(payload: dict) -> None:
     directory = os.path.dirname(os.path.abspath(MEMORY_FILE))
     if directory:
         os.makedirs(directory, exist_ok=True)
@@ -362,10 +386,12 @@ async def save_memory_to_discord() -> None:
 
 
 async def save_memory(*, force_discord: bool = False) -> None:
-    global _memory_dirty
+    global _memory_dirty, memory_saved_at
     async with get_memory_lock():
+        memory_saved_at = time.time()
+        payload = memory_payload()
         try:
-            await asyncio.to_thread(dump_memory)
+            await asyncio.to_thread(dump_memory, payload)
         except Exception as error:
             print(f"Memory save failure: {error}")
         _memory_dirty = True
@@ -608,31 +634,67 @@ def strip_html_text(raw: str) -> str:
     return raw
 
 
+def host_is_blocked(host: str) -> bool:
+    host = (host or "").strip(".").lower()
+    if not host:
+        return True
+    if host in {"localhost", "metadata.google.internal", "metadata.internal"}:
+        return True
+    return host.endswith((".local", ".internal", ".localhost", ".localdomain"))
+
+
+def ip_is_public(address: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(str(address).split("%", 1)[0])
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return bool(ip.is_global)
+
+
 def url_is_safe(url: str) -> bool:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or parsed.username or parsed.password:
         return False
-    host = (parsed.hostname or "").strip(".").lower()
-    if (
-        not host
-        or host in {"localhost", "metadata.google.internal"}
-        or host.endswith((".local", ".internal", ".localhost"))
-    ):
+    host = parsed.hostname or ""
+    if host_is_blocked(host):
         return False
     try:
         addresses = {info[4][0] for info in socket.getaddrinfo(host, None)}
     except socket.gaierror:
         return False
-    if not addresses:
-        return False
-    for address in addresses:
-        try:
-            ip = ipaddress.ip_address(address)
-        except ValueError:
-            return False
-        if not ip.is_global:
-            return False
-    return True
+    return bool(addresses) and all(ip_is_public(address) for address in addresses)
+
+
+class SafeResolver(aiohttp.DefaultResolver):
+    """Use the DNS answer aiohttp will actually connect to, not an earlier lookup."""
+
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        if host_is_blocked(host):
+            raise OSError(f"Blocked host: {host}")
+        results = await super().resolve(host, port, family)
+        safe = [
+            item
+            for item in results
+            if ip_is_public(str(item.get("host", "")))
+        ]
+        if not safe:
+            raise OSError(f"Blocked address for {host}")
+        return safe
+
+
+def open_http_session(
+    timeout: aiohttp.ClientTimeout,
+    headers: dict | None = None,
+) -> aiohttp.ClientSession:
+    connector = aiohttp.TCPConnector(resolver=SafeResolver())
+    return aiohttp.ClientSession(
+        timeout=timeout,
+        headers=headers,
+        connector=connector,
+    )
 
 
 async def fetch_limited(
@@ -682,7 +744,7 @@ async def fetch_web_context(query: str, deep: bool = False) -> str:
     wiki_limit = "5" if deep else "3"
     ddg_limit = 12 if deep else 8
 
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+    async with open_http_session(timeout, headers) as session:
         for wiki in (
             "https://es.wikipedia.org/w/api.php",
             "https://en.wikipedia.org/w/api.php",
@@ -1064,17 +1126,15 @@ Keep responses reasonably concise unless more detail is requested.
     answer = completion.choices[0].message.content or "No response generated."
     elapsed = time.monotonic() - start_time
     thinking_seconds = max(1, round(elapsed))
-    reply_snippet = " ".join(answer.split())[:REPLY_STORE_CHARS]
+    return format_thought_line(thinking_seconds), answer
 
+
+def store_exchange(channel_id: int, username: str, clean_prompt: str, answer: str) -> None:
     ai_history[channel_id].append({
         "user": username,
         "prompt": clean_prompt[:PROMPT_STORE_CHARS],
-        "reply": reply_snippet,
+        "reply": " ".join((answer or "").split())[:REPLY_STORE_CHARS],
     })
-    await save_memory()
-
-    thought_line = format_thought_line(thinking_seconds)
-    return thought_line, answer
 
 
 def format_thought_line(thinking_seconds: int) -> str:
@@ -1166,6 +1226,16 @@ async def handle_chat_prompt(message: discord.Message, prompt: str, is_dm: bool)
                 edit=edit if thinking_msg is not None else None,
             )
             answered = True
+            try:
+                store_exchange(
+                    message.channel.id,
+                    message.author.display_name,
+                    clean_prompt,
+                    answer,
+                )
+                await save_memory()
+            except Exception as error:
+                print(f"Could not store the delivered reply: {error}")
     except Exception as error:
         print(f"AI message request failure: {error}")
         if not answered:
@@ -1421,6 +1491,16 @@ async def talk(
             edit=None if is_dm else edit,
         )
         answered = True
+        try:
+            store_exchange(
+                interaction.channel.id if interaction.channel else 0,
+                interaction.user.display_name,
+                clean_prompt,
+                answer,
+            )
+            await save_memory()
+        except Exception as error:
+            print(f"Could not store the delivered reply: {error}")
     except Exception as error:
         print(f"AI request failure: {error}")
         if not answered:
@@ -1490,7 +1570,7 @@ async def launch_discord_activity(interaction: discord.Interaction) -> bool:
             f"{interaction.id}/{interaction.token}/callback"
         )
         timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with open_http_session(timeout) as session:
             async with session.post(url, json={"type": 12}) as response:
                 if response.status in (200, 204):
                     return True
@@ -1676,7 +1756,7 @@ async def petpet(
 
         elif url is not None:
             timeout = aiohttp.ClientTimeout(total=15)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with open_http_session(timeout) as session:
                 status, content_type, image_bytes = await fetch_limited(
                     session, url, 8_000_000
                 )
@@ -1695,7 +1775,7 @@ async def petpet(
                     avatar_url = member.display_avatar.with_format("png").url
 
             timeout = aiohttp.ClientTimeout(total=15)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with open_http_session(timeout) as session:
                 status, _, image_bytes = await fetch_limited(session, avatar_url, 8_000_000)
             if status != 200 or not image_bytes:
                 raise ValueError(f"Could not download the avatar (HTTP {status}).")
@@ -1708,7 +1788,7 @@ async def petpet(
         ]
 
         timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with open_http_session(timeout) as session:
             async def fetch_frame(frame_url: str) -> bytes:
                 status, _, data = await fetch_limited(session, frame_url, 2_000_000)
                 if status != 200 or not data:
@@ -2013,4 +2093,5 @@ bot.close = close
 
 if __name__ == "__main__":
     keep_alive()
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     bot.run(TOKEN)
