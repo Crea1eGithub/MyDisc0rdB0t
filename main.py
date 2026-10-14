@@ -1004,6 +1004,21 @@ async def set_fun_fact_status() -> None:
     )
 
 
+RETIRED_GROQ_MODELS = {"groq/compound", "groq/compound-mini"}
+
+
+def active_search_model() -> str:
+    """Groq shut down compound (and its browser_search tool) on 2026-09-21."""
+    model = (SEARCH_MODEL or "").strip()
+    if model.lower() in RETIRED_GROQ_MODELS:
+        print(
+            f"Search model {model} was retired by Groq on 2026-09-21. "
+            f"Using {AI_MODEL} instead."
+        )
+        return AI_MODEL
+    return model or AI_MODEL
+
+
 def resolve_ai_client(night_owl: bool) -> tuple[OpenAI | None, str | None]:
     online = is_ai_online()
     if not online and not night_owl:
@@ -1029,23 +1044,26 @@ async def generate_ai_response(
 ) -> tuple[str, str]:
     history_text = await build_memory_block(channel_id)
     emoji_text = format_guild_emojis(guild)
-    use_lite_search = use_search and not deep_search
-    use_groq_browse = deep_search
-    model = SEARCH_MODEL if use_groq_browse else AI_MODEL
     web_context = ""
-
-    if use_groq_browse:
+    # Deep search used to send tools=[{type: browser_search}] to Groq compound.
+    # That system was removed, so gpt-oss rejected the tool and the bot fell
+    # back to a light lookup. Page fetches stay on the SSRF-checked client.
+    if deep_search:
+        model = active_search_model()
+        web_context = await fetch_web_context(clean_prompt, deep=True)
         search_line = (
-            "You have Groq browser_search. Use it once, briefly, only if needed. "
-            "Do not invent sources. Keep the answer short."
+            "Web snippets and short page extracts were fetched with Wikipedia and DuckDuckGo. "
+            "Use them if relevant. Do not invent sources or links. Keep the answer short."
         )
-    elif use_lite_search:
+    elif use_search:
+        model = AI_MODEL
         web_context = await fetch_web_context(clean_prompt, deep=False)
         search_line = (
-            "Web snippets were fetched with Wikipedia/DuckDuckGo (not Groq browse). "
+            "Web snippets were fetched with Wikipedia and DuckDuckGo. "
             "Use them if relevant. Do not invent sources. Keep the answer short."
         )
     else:
+        model = AI_MODEL
         search_line = (
             "You cannot browse the web in this request. Answer from what you know. "
             "If the user needs facts from 2024 onward, say you may be outdated."
@@ -1092,12 +1110,8 @@ Keep responses reasonably concise unless more detail is requested.
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ],
-        "max_tokens": MAX_SEARCH_TOKENS if use_groq_browse else MAX_ANSWER_TOKENS,
+        "max_tokens": MAX_SEARCH_TOKENS if deep_search else MAX_ANSWER_TOKENS,
     }
-    if use_groq_browse:
-        request["tools"] = [{"type": "browser_search"}]
-        request["tool_choice"] = "auto"
-        request["extra_body"] = {"reasoning_effort": "low"}
 
     start_time = time.monotonic()
     try:
@@ -1107,20 +1121,13 @@ Keep responses reasonably concise unless more detail is requested.
         )
     except Exception as error:
         print(f"Primary AI request failure ({model}): {error}")
-        if not (use_lite_search or use_groq_browse):
+        if not deep_search or model == AI_MODEL:
             raise
-        if not web_context:
-            web_context = await fetch_web_context(clean_prompt, deep=False)
-        fallback_prompt = (
-            f"{clean_prompt}\n\nWeb snippets (may be incomplete):\n{web_context}"
-        )
+        print(f"Retrying deep search with {AI_MODEL}.")
         completion = await asyncio.to_thread(
             client.chat.completions.create,
             model=AI_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": fallback_prompt},
-            ],
+            messages=request["messages"],
             max_tokens=MAX_ANSWER_TOKENS,
         )
     answer = completion.choices[0].message.content or "No response generated."
@@ -1425,7 +1432,7 @@ async def on_message(message: discord.Message):
 )
 @app_commands.describe(
     prompt="What you want to ask the AI.",
-    deep_search="Read a few web pages (still 1 Groq call). Default: off.",
+    deep_search="Look up a few web pages before answering. Default: off.",
 )
 async def talk(
     interaction: discord.Interaction,
