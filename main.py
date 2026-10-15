@@ -84,8 +84,8 @@ SNIPPET_CHARS = 72
 PROMPT_STORE_CHARS = 160
 REPLY_STORE_CHARS = 140
 EMOJI_PROMPT_LIMIT = 12
-MAX_ANSWER_TOKENS = 500
-MAX_SEARCH_TOKENS = 350
+MAX_ANSWER_TOKENS = 800
+MAX_SEARCH_TOKENS = 600
 STATUS_ROTATE_MINUTES = 8
 MEMORY_FILE = os.getenv("MEMORY_FILE", "memory.json")
 MEMORY_CHANNEL_ID = os.getenv("MEMORY_CHANNEL_ID")
@@ -912,10 +912,37 @@ async def release_talk_turn(user: discord.abc.User) -> None:
         refund_talk_quota(user)
 
 
-def fit_discord_message(text: str, limit: int = 2000) -> str:
-    if len(text) <= limit:
+def discord_units(text: str) -> int:
+    """Discord counts UTF-16 code units, not Python characters."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def clip_discord(text: str, limit: int = 2000) -> str:
+    if discord_units(text) <= limit:
         return text
-    return text[: limit - 1] + "…"
+    ellipsis = "…"
+    budget = limit - discord_units(ellipsis)
+    if budget < 1:
+        return ""
+    kept: list[str] = []
+    used = 0
+    for char in text:
+        size = discord_units(char)
+        if used + size > budget:
+            break
+        kept.append(char)
+        used += size
+    return "".join(kept) + ellipsis
+
+
+def take_discord_prefix(text: str, limit: int) -> tuple[str, str]:
+    used = 0
+    for index, char in enumerate(text):
+        size = discord_units(char)
+        if used + size > limit:
+            return text[:index], text[index:]
+        used += size
+    return text, ""
 
 
 def can_speak_as_bot(user: discord.abc.User) -> bool:
@@ -1104,33 +1131,35 @@ Keep responses reasonably concise unless more detail is requested.
             f"{clean_prompt}\n\nWeb snippets (may be incomplete):\n{web_context}"
         )
 
-    request = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
-        "max_tokens": MAX_SEARCH_TOKENS if deep_search else MAX_ANSWER_TOKENS,
-    }
+    request_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
+    max_tokens = MAX_SEARCH_TOKENS if deep_search else MAX_ANSWER_TOKENS
 
     start_time = time.monotonic()
     try:
-        completion = await asyncio.to_thread(
-            client.chat.completions.create,
-            **request,
+        completion = await complete_chat(
+            client,
+            model=model,
+            messages=request_messages,
+            max_tokens=max_tokens,
         )
     except Exception as error:
         print(f"Primary AI request failure ({model}): {error}")
         if not deep_search or model == AI_MODEL:
             raise
         print(f"Retrying deep search with {AI_MODEL}.")
-        completion = await asyncio.to_thread(
-            client.chat.completions.create,
-            model=AI_MODEL,
-            messages=request["messages"],
+        model = AI_MODEL
+        completion = await complete_chat(
+            client,
+            model=model,
+            messages=request_messages,
             max_tokens=MAX_ANSWER_TOKENS,
         )
-    answer = completion.choices[0].message.content or "No response generated."
+    answer = visible_answer(completion)
+    if not answer:
+        raise RuntimeError(f"Empty AI answer from {model}")
     elapsed = time.monotonic() - start_time
     thinking_seconds = max(1, round(elapsed))
     return format_thought_line(thinking_seconds), answer
@@ -1142,6 +1171,40 @@ def store_exchange(channel_id: int, username: str, clean_prompt: str, answer: st
         "prompt": clean_prompt[:PROMPT_STORE_CHARS],
         "reply": " ".join((answer or "").split())[:REPLY_STORE_CHARS],
     })
+
+
+THINK_RE = re.compile(r"<think>[\s\S]*?</think>", flags=re.IGNORECASE)
+OPEN_THINK_RE = re.compile(r"<think>[\s\S]*$", flags=re.IGNORECASE)
+
+
+def model_uses_reasoning(model: str) -> bool:
+    return "gpt-oss" in (model or "").lower()
+
+
+def visible_answer(completion) -> str:
+    message = completion.choices[0].message
+    content = message.content or ""
+    if not isinstance(content, str):
+        content = str(content)
+    content = THINK_RE.sub("", content)
+    content = OPEN_THINK_RE.sub("", content)
+    return content.strip()
+
+
+async def complete_chat(client: OpenAI, *, model: str, messages: list, max_tokens: int):
+    kwargs = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+    }
+    # gpt-oss reasons by default. Those tokens count against max_tokens, so a
+    # 500-token Discord reply often came back empty and still spent a credit.
+    if model_uses_reasoning(model):
+        kwargs["extra_body"] = {
+            "reasoning_effort": "low",
+            "include_reasoning": False,
+        }
+    return await asyncio.to_thread(client.chat.completions.create, **kwargs)
 
 
 def format_thought_line(thinking_seconds: int) -> str:
@@ -1279,17 +1342,19 @@ async def send_ai_chunks(
     answer: str,
     edit=None,
 ) -> None:
-    header = f"-# {prompt_preview(clean_prompt)}\n{thought_line}"
-    if len(header) > 2000:
-        header = header[:1999] + "…"
+    header = clip_discord(f"-# {prompt_preview(clean_prompt)}\n{thought_line}")
     response_text = f"{header}\n{answer}"
     first = edit or send
-    if len(response_text) <= 2000:
+    if discord_units(response_text) <= 2000:
         await first(response_text)
         return
     await first(header)
-    for start in range(0, len(answer), 1900):
-        await send(answer[start:start + 1900])
+    rest = answer
+    while rest:
+        chunk, rest = take_discord_prefix(rest, 1900)
+        if not chunk:
+            break
+        await send(chunk)
 
 
 @tasks.loop(minutes=STATUS_ROTATE_MINUTES)
@@ -1616,14 +1681,14 @@ async def say(interaction: discord.Interaction, message: str):
         return
 
     text = message.replace("\\n", "\n")
-    if not text.strip() or len(text) > 2000:
+    if not text.strip() or discord_units(text) > 2000:
         await interaction.response.send_message(
             get_string(user_id, "say_length"),
             ephemeral=True,
         )
         return
 
-    await interaction.response.send_message(text)
+    await interaction.response.send_message(text, allowed_mentions=NO_USER_PINGS)
 
 
 @bot.tree.command(
@@ -1644,7 +1709,7 @@ async def choose(interaction: discord.Interaction, options: str):
 
     choice = random.choice(choices)
     await interaction.response.send_message(
-        fit_discord_message(get_string(user_id, "choose_result").format(choice=choice)),
+        clip_discord(get_string(user_id, "choose_result").format(choice=choice)),
         allowed_mentions=NO_USER_PINGS,
     )
 
@@ -2023,7 +2088,7 @@ async def eightball(interaction: discord.Interaction, question: str):
     ball_title = get_string(user_id, "ball_title")
 
     await interaction.response.send_message(
-        fit_discord_message(
+        clip_discord(
             f"❓ **{query_label}:** {question}\n"
             f"{ball_title} {outcome}"
         ),
