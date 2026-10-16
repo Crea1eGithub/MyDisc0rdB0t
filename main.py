@@ -156,6 +156,7 @@ _memory_dirty = False
 _discord_memory_loaded = False
 command_sync_fingerprint_saved = ""
 memory_saved_at = 0.0
+BOT_STARTED_AT = time.monotonic()
 
 
 def get_memory_lock() -> asyncio.Lock:
@@ -471,6 +472,16 @@ LOCALIZATION = {
         "talk_user_limit": "🚫 You reached today's limit of **{limit}** AI messages. It resets at **00:00 UTC-5**.",
         "talk_global_limit": "🚫 The bot reached today's global AI limit. It resets at **00:00 UTC-5**.",
         "purge_channel": "This command only works in a text channel or thread.",
+        "quota_ai_on": "AI is **online** (06:00–21:00 UTC-5).",
+        "quota_ai_off": "AI is **offline** until 06:00 UTC-5 (hours: 06:00–21:00).",
+        "quota_night_on": "Night Owl is **configured** for after-hours requests.",
+        "quota_night_off": "Night Owl is **not configured**.",
+        "quota_owner": "Your AI limit: **none** (owner). Bot-wide today: **{global_used}/{global_limit}**.",
+        "quota_uses": "Your AI messages today: **{used}/{limit}**. Bot-wide: **{global_used}/{global_limit}**.",
+        "quota_wait": "Cooldown: wait **{wait}s**.",
+        "quota_ready": "Cooldown: **ready**.",
+        "quota_reset": "Counters reset at **00:00 UTC-5**.",
+        "quota_uptime": "Uptime: **{uptime}** · latency: **{latency}ms**.",
     },
     True: {
         "invalid_die": "Error de ejecución: Un dado válido debe poseer al menos 2 lados.",
@@ -504,6 +515,16 @@ LOCALIZATION = {
         "talk_user_limit": "🚫 Llegaste a tu límite de **{limit}** mensajes de IA hoy. Se reinicia a las **00:00 UTC-5**.",
         "talk_global_limit": "🚫 El bot llegó al límite global de IA de hoy. Se reinicia a las **00:00 UTC-5**.",
         "purge_channel": "Este comando solo funciona en un canal de texto o un hilo.",
+        "quota_ai_on": "La IA está **en línea** (06:00–21:00 UTC-5).",
+        "quota_ai_off": "La IA está **fuera de horario** hasta las 06:00 UTC-5 (horario: 06:00–21:00).",
+        "quota_night_on": "Night Owl está **configurado** para usarla fuera de horario.",
+        "quota_night_off": "Night Owl **no está configurado**.",
+        "quota_owner": "Tu límite de IA: **ninguno** (owner). Total del bot hoy: **{global_used}/{global_limit}**.",
+        "quota_uses": "Tus mensajes de IA hoy: **{used}/{limit}**. Total del bot: **{global_used}/{global_limit}**.",
+        "quota_wait": "Cooldown: espera **{wait}s**.",
+        "quota_ready": "Cooldown: **listo**.",
+        "quota_reset": "Los contadores se reinician a las **00:00 UTC-5**.",
+        "quota_uptime": "Tiempo activo: **{uptime}** · latencia: **{latency}ms**.",
     },
 }
 
@@ -605,11 +626,13 @@ def cache_search(query: str, snippets: str) -> None:
 
 
 def cached_search(query: str) -> str | None:
-    item = _search_cache.get(query.lower()[:200])
+    key = query.lower()[:200]
+    item = _search_cache.get(key)
     if not item:
         return None
     stored_at, snippets = item
     if time.monotonic() - stored_at > 900:
+        _search_cache.pop(key, None)
         return None
     return snippets
 
@@ -826,7 +849,12 @@ async def fetch_web_context(query: str, deep: bool = False) -> str:
         seen.add(line)
         unique.append(line)
 
-    result = "\n".join(unique[: (14 if deep else 8)]) or "No web results found."
+    if not unique:
+        # Don't cache a miss. A short DuckDuckGo/Wikipedia outage was sticking
+        # for 15 minutes and the model treated it as "nothing exists".
+        return "No web results found."
+
+    result = "\n".join(unique[: (14 if deep else 8)])
     cache_search(cache_key, result)
     return result
 
@@ -910,6 +938,42 @@ async def take_talk_turn(user: discord.abc.User) -> str | None:
 async def release_talk_turn(user: discord.abc.User) -> None:
     async with get_quota_lock():
         refund_talk_quota(user)
+
+
+async def read_talk_quota(user: discord.abc.User) -> dict:
+    async with get_quota_lock():
+        reset_talk_usage_if_needed()
+        user_key = str(user.id)
+        wait = 0
+        if not is_owner(user):
+            last = talk_usage["last"].get(user_key)
+            if last is not None:
+                try:
+                    elapsed = colombia_now().timestamp() - float(last)
+                except (TypeError, ValueError):
+                    elapsed = TALK_COOLDOWN_SECONDS
+                if elapsed < TALK_COOLDOWN_SECONDS:
+                    wait = max(1, int(TALK_COOLDOWN_SECONDS - elapsed))
+        return {
+            "owner": is_owner(user),
+            "used": int(talk_usage["users"].get(user_key, 0)),
+            "global_used": int(talk_usage.get("global", 0)),
+            "wait": wait,
+            "online": is_ai_online(),
+            "night_owl": bool(NIGHT_OWL_KEY),
+        }
+
+
+def format_uptime(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
 
 
 def discord_units(text: str) -> int:
@@ -1588,6 +1652,47 @@ async def talk(
                 await interaction.edit_original_response(content=fail)
         except Exception:
             print("Could not report the AI failure to Discord.")
+
+
+@bot.tree.command(
+    name="quota",
+    description="Show AI hours, your remaining daily messages, and uptime.",
+)
+async def quota(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    snap = await read_talk_quota(interaction.user)
+    lines = [
+        get_string(user_id, "quota_ai_on" if snap["online"] else "quota_ai_off"),
+        get_string(user_id, "quota_night_on" if snap["night_owl"] else "quota_night_off"),
+    ]
+    if snap["owner"]:
+        lines.append(
+            get_string(user_id, "quota_owner").format(
+                global_used=snap["global_used"],
+                global_limit=TALK_GLOBAL_DAILY_LIMIT,
+            )
+        )
+    else:
+        lines.append(
+            get_string(user_id, "quota_uses").format(
+                used=snap["used"],
+                limit=TALK_USER_DAILY_LIMIT,
+                global_used=snap["global_used"],
+                global_limit=TALK_GLOBAL_DAILY_LIMIT,
+            )
+        )
+        if snap["wait"]:
+            lines.append(get_string(user_id, "quota_wait").format(wait=snap["wait"]))
+        else:
+            lines.append(get_string(user_id, "quota_ready"))
+    lines.append(get_string(user_id, "quota_reset"))
+    lines.append(
+        get_string(user_id, "quota_uptime").format(
+            uptime=format_uptime(int(time.monotonic() - BOT_STARTED_AT)),
+            latency=round(bot.latency * 1000),
+        )
+    )
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @bot.tree.command(
