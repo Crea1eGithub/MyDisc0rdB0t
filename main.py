@@ -1593,10 +1593,13 @@ async def talk(
     is_dm = interaction.guild is None
     answered = False
     try:
-        if is_dm:
-            await interaction.response.defer()
-        else:
-            await interaction.response.send_message(thinking_status_text())
+        # Editing this message completes the interaction. A defer plus a
+        # follow-up leaves the original "thinking" state up, and Discord
+        # marks it failed after the token expires. DMs hit that path before.
+        await interaction.response.send_message(
+            thinking_status_text(),
+            allowed_mentions=NO_USER_PINGS,
+        )
 
         async def send(content):
             await interaction.followup.send(content, allowed_mentions=NO_USER_PINGS)
@@ -1624,7 +1627,7 @@ async def talk(
             clean_prompt,
             thought_line,
             answer,
-            edit=None if is_dm else edit,
+            edit=edit,
         )
         answered = True
         try:
@@ -1644,12 +1647,13 @@ async def talk(
             await save_memory()
         fail = "⚠️ The AI service could not process the request right now."
         try:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(fail, ephemeral=True)
-            elif is_dm:
-                await interaction.followup.send(fail)
+            if interaction.response.is_done():
+                await interaction.edit_original_response(
+                    content=fail,
+                    allowed_mentions=NO_USER_PINGS,
+                )
             else:
-                await interaction.edit_original_response(content=fail)
+                await interaction.response.send_message(fail, ephemeral=True)
         except Exception:
             print("Could not report the AI failure to Discord.")
 
@@ -1746,7 +1750,7 @@ async def launch_discord_activity(interaction: discord.Interaction) -> bool:
             f"https://discord.com/api/v10/interactions/"
             f"{interaction.id}/{interaction.token}/callback"
         )
-        timeout = aiohttp.ClientTimeout(total=10)
+        timeout = aiohttp.ClientTimeout(total=2)
         async with open_http_session(timeout) as session:
             async with session.post(url, json={"type": 12}) as response:
                 if response.status in (200, 204):
@@ -2038,13 +2042,22 @@ async def petpet(
         await interaction.followup.send(
             file=discord.File(gif_buffer, filename="petpet.gif")
         )
+        try:
+            await interaction.delete_original_response()
+        except Exception as error:
+            print(f"Could not remove the PetPet placeholder: {error}")
 
     except Exception as error:
         print(f"PetPet failure: {error}")
-        await interaction.followup.send(
-            "⚠️ PetPet could not generate the GIF. "
-            f"Reason: `{error}`"
-        )
+        reason = " ".join(str(error).split())[:180].replace("`", "'")
+        message = f"⚠️ PetPet could not generate the GIF. Reason: {reason}"
+        try:
+            if interaction.response.is_done():
+                await interaction.edit_original_response(content=message)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except Exception:
+            print("Could not report the PetPet failure to Discord.")
 
 
 @bot.tree.command(name="rng", description="Generate a random integer in a range.")
@@ -2113,10 +2126,10 @@ async def purge(interaction: discord.Interaction, limit: int):
         response = get_string(user_id, "purge_success").format(
             count=len(deleted)
         )
-        await interaction.followup.send(response)
+        await interaction.edit_original_response(content=response)
     except (discord.Forbidden, discord.HTTPException) as error:
-        await interaction.followup.send(
-            f"Could not delete messages: {error}"
+        await interaction.edit_original_response(
+            content=f"Could not delete messages: {error}"
         )
 
 
